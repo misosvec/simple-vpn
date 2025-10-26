@@ -16,7 +16,7 @@ func GenerateKey() []byte {
 	return key
 }
 
-func Encrypt(plaintext []byte, key []byte) []byte {
+func Encrypt(plaintext []byte, key []byte) ([]byte, []byte) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		panic(err)
@@ -33,5 +33,24 @@ func Encrypt(plaintext []byte, key []byte) []byte {
 		panic(err)
 	}
 
-	return gcm.Seal(nil, nonce, plaintext, nil)
+	return nonce, gcm.Seal(nil, nonce, plaintext, nil)
+}
+
+func Decrypt(nonce []byte, ciphertext []byte, key []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return plaintext, nil
 }
