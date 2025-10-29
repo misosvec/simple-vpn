@@ -3,18 +3,10 @@ package common
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/ecdh"
 	"crypto/rand"
 	"io"
 )
-
-func GenerateKey() []byte {
-	key := make([]byte, 32)
-	_, err := rand.Read(key)
-	if err != nil {
-		panic(err)
-	}
-	return key
-}
 
 func Encrypt(plaintext []byte, key []byte) ([]byte, []byte) {
 	block, err := aes.NewCipher(key)
@@ -53,4 +45,13 @@ func Decrypt(nonce []byte, ciphertext []byte, key []byte) ([]byte, error) {
 	}
 
 	return plaintext, nil
+}
+
+func GeneratePubPrivKeys() (*ecdh.PrivateKey, *ecdh.PublicKey) {
+	curve := ecdh.X25519()
+	privKey, err := curve.GenerateKey(rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	return privKey, privKey.PublicKey()
 }
