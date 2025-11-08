@@ -1,14 +1,14 @@
 FROM golang:1.25-alpine
 
-# Install tcpdump (and a few useful debugging tools)
-RUN apk add --no-cache tcpdump iproute2
+RUN apk add --no-cache tcpdump iproute2 curl
 
 WORKDIR /app
 
-COPY client .
-COPY common .
-
+COPY go.mod go.sum ./
 RUN go mod download
+
+COPY client/ ./client/
+COPY common/ ./common/
 
 RUN go build -o ./client/run ./client
 
