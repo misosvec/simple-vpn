@@ -1,6 +1,6 @@
 FROM golang:1.25-alpine
 
-RUN apk add --no-cache tcpdump iproute2 curl
+RUN apk add --no-cache bash tcpdump iproute2 curl
 
 WORKDIR /app
 
