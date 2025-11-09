@@ -4,6 +4,7 @@ import (
 	"crypto/ecdh"
 	"fmt"
 	"net"
+	"os/exec"
 	"strconv"
 	"vpn/common"
 
@@ -12,8 +13,33 @@ import (
 
 const macOsTunOffset = 4
 const mtu = 1500 // maximum transmission unit = the largest size of single packet
-const address = "localhost"
+const address = "vpn-server-cont"
 const port = 8000
+const tunIface = "tun7"
+
+func main() {
+	clientPrivKey, clientPubKey := common.GeneratePubPrivKeys()
+	server := connectToServer()
+	serverPubKey, err := exchangeKeys(server, clientPubKey)
+	if err != nil {
+		panic(err)
+	}
+	sharedKey, err := clientPrivKey.ECDH(serverPubKey)
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Println("client shared key is ", sharedKey)
+
+	dr, err := common.GetDefaultRoute()
+	if err != nil {
+		panic(err)
+	}
+
+	tun := SetupTunInterface(tunIface)
+	defer RestoreNetworkSettings(tun, dr)
+	handleOutgoingPackets(tun, sharedKey, server)
+}
 
 func connectToServer() net.Conn {
 	conn, err := net.Dial("udp", address+":"+strconv.Itoa(port)) // <- fix here
@@ -33,14 +59,7 @@ func handlePacket(packet []byte, key []byte, server net.Conn) {
 	fmt.Println("client packet written")
 }
 
-func handleTun(key []byte, server net.Conn) {
-	tunDev, err := tun.CreateTUN("utun7", mtu)
-	if err != nil {
-		panic(err)
-	}
-
-	defer tunDev.Close()
-
+func handleOutgoingPackets(tunDev tun.Device, key []byte, server net.Conn) {
 	numBuffers := 10
 	bufs := make([][]byte, numBuffers)
 
@@ -58,40 +77,52 @@ func handleTun(key []byte, server net.Conn) {
 		}
 
 		fmt.Println("packet was read in client")
-		go handlePacket(bufs[0], key, server)
+		fmt.Println(bufs[0])
+		// go handlePacket(bufs[0], key, server)
 	}
 
 }
 
-func exchangeKeys(server net.Conn, clientPubKey *ecdh.PublicKey) *ecdh.PublicKey {
+func exchangeKeys(server net.Conn, clientPubKey *ecdh.PublicKey) (*ecdh.PublicKey, error) {
 	server.Write(append([]byte{byte(common.KeyExchangeMsg)}, clientPubKey.Bytes()...))
-	fmt.Println("client sent key to server")
-	buf := make([]byte, len(clientPubKey.Bytes())+1)
+	keyLength := len(clientPubKey.Bytes())
+
+	buf := make([]byte, keyLength+1)
 	_, err := server.Read(buf)
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
-	fmt.Println("client received server key")
-	serverPubKey, err := ecdh.X25519().NewPublicKey(buf[1:33])
-	if err != nil {
-		panic(err)
+
+	if common.GetMessageType(buf) == common.KeyExchangeMsg {
+		serverPubKey, err := ecdh.X25519().NewPublicKey(buf[1 : keyLength+1])
+		if err != nil {
+			return nil, err
+		}
+		return serverPubKey, nil
 	}
-	return serverPubKey
+
+	return nil, fmt.Errorf("Failed to exchange encryption keys, try again later.")
 }
 
-func main() {
-
-	// key := common.GenerateKey()
-	clientPrivKey, clientPubKey := common.GeneratePubPrivKeys()
-	server := connectToServer()
-	serverPubKey := exchangeKeys(server, clientPubKey)
-	sharedKey, err := clientPrivKey.ECDH(serverPubKey)
-	fmt.Println("client shared key is ", sharedKey)
+func SetupTunInterface(tunName string) tun.Device {
+	dev, err := tun.CreateTUN(tunName, mtu)
 	if err != nil {
 		panic(err)
 	}
-	handleTun(sharedKey, server)
+	err = exec.Command("ip", "link", "set", tunName, "up").Run()
+	if err != nil {
+		panic(err)
+	}
+	common.SetDefaultRoute([]string{"default", "dev", tunName})
+	return dev
+}
 
+func RestoreNetworkSettings(tunDevice tun.Device, defaultRoute []string) {
+	tunDevice.Close()
+	if defaultRoute != nil {
+
+	}
+	common.SetDefaultRoute(defaultRoute)
 }
 
 // this code can be tested using
