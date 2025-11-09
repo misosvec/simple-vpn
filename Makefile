@@ -1,9 +1,11 @@
 # Makefile for running Go VPN client and server containers
-
 IMAGE_CLIENT = vpn-client
 IMAGE_SERVER = vpn-server
+SERVER_CONT = "vpn-server-cont"
+CLIENT_CONT = "vpn-client-cont"
 NETWORK = vpn-network
 WORKDIR = /app
+BASH = "bash"
 
 .PHONY: client server build-client build-server ensure-network
 
@@ -11,19 +13,20 @@ WORKDIR = /app
 client: ensure-network build-client
 	@echo "Starting VPN client container..."
 	docker run --cap-add=NET_ADMIN --device /dev/net/tun -it --rm \
+		--name $(CLIENT_CONT) \
 		-v "$(PWD):$(WORKDIR)" \
 		--network $(NETWORK) \
 		-w $(WORKDIR) \
-		$(IMAGE_CLIENT) sh
+		$(IMAGE_CLIENT) $(BASH)
 
 server: ensure-network build-server
 	@echo "Starting VPN server container..."
 	docker run --cap-add=NET_ADMIN --device /dev/net/tun -it --rm \
-		--name vpn-server-cont \
+		--name $(SERVER_CONT) \
 		--network $(NETWORK) \
 		-v "$(PWD):$(WORKDIR)" \
 		-w $(WORKDIR) \
-		$(IMAGE_SERVER) sh
+		$(IMAGE_SERVER) $(BASH)
 
 # --- Helper targets ---
 
@@ -51,16 +54,26 @@ ensure-network:
 		echo "Network $(NETWORK) already exists."; \
 	fi
 
+client-bash:
+	@docker exec -it $(CLIENT_CONT) $(BASH)
+
+server-bash:
+	@docker exec -it $(SERVER_CONT) $(BASH)
+
 clean-client:
 	@echo "Forcefully removing any running VPN client containers..."
 	@docker ps -aq --filter ancestor=$(IMAGE_CLIENT) | xargs -r docker rm -f
 	@docker ps -aq --filter name=vpn-client-cont | xargs -r docker rm -f
+	@echo "Removing VPN client image..."
+	@docker rmi -f $(IMAGE_CLIENT) 2>/dev/null || true
 	@echo "Done."
 
 clean-server:
 	@echo "Forcefully removing any running VPN server containers..."
 	@docker ps -aq --filter ancestor=$(IMAGE_SERVER) | xargs -r docker rm -f
 	@docker ps -aq --filter name=vpn-server-cont | xargs -r docker rm -f
+	@echo "Removing VPN server image..."
+	@docker rmi -f $(IMAGE_SERVER) 2>/dev/null || true
 	@echo "Done."
 
 clean-all: clean-client clean-server
