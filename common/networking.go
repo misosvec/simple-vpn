@@ -1,10 +1,11 @@
 package common
 
 import (
-	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
+
+	"golang.zx2c4.com/wireguard/tun"
 )
 
 func GetDefaultRoute() ([]string, error) {
@@ -19,13 +20,15 @@ func GetDefaultRoute() ([]string, error) {
 			return strings.Split(line, " "), nil
 		}
 	}
-	return nil, errors.New("Failed to determine default gateway")
+	return nil, nil
 }
 
 func SetDefaultRoute(route []string) error {
 	err := exec.Command("ip", "route", "del", "default").Run()
 	if err != nil {
-		return fmt.Errorf("Failed to delete default interface: %w", err)
+		if e := err.(*exec.ExitError); e.ExitCode() != 2 {
+			return fmt.Errorf("Failed to delete default interface: %w", err)
+		}
 	}
 	args := append([]string{"route", "add"}, route...)
 	err = exec.Command("ip", args...).Run()
@@ -35,18 +38,31 @@ func SetDefaultRoute(route []string) error {
 	return nil
 }
 
-func CreateTunInterface(tunName string) error {
-	err := exec.Command("ip", "tuntap", "add", "dev", tunName, "mode", "tun").Run()
-	if err != nil {
-		return fmt.Errorf("Failed to create %q interface: %w", tunName, err)
-	}
+// the wireguaard library will be used instead to handle this
+// func CreateTunInterface(tunName string) error {
+// 	err := exec.Command("ip", "tuntap", "add", "dev", tunName, "mode", "tun").Run()
+// 	if err != nil {
+// 		return fmt.Errorf("Failed to create %q interface: %w", tunName, err)
+// 	}
 
-	err = exec.Command("ip", "link", "set", "dev", tunName, "up").Run()
-	if err != nil {
-		return fmt.Errorf("Failed to enable %q interface: %w", tunName, err)
-	}
+// 	err = exec.Command("ip", "link", "set", "dev", tunName, "up").Run()
+// 	if err != nil {
+// 		return fmt.Errorf("Failed to enable %q interface: %w", tunName, err)
+// 	}
 
-	return nil
+// 	return nil
+// }
+
+func CreateTunInterface(iface string, mtu int) tun.Device {
+	dev, err := tun.CreateTUN(iface, mtu)
+	if err != nil {
+		panic(err)
+	}
+	err = exec.Command("ip", "link", "set", iface, "up").Run()
+	if err != nil {
+		panic(err)
+	}
+	return dev
 }
 
 func DeleteInterface(iface string) error {
