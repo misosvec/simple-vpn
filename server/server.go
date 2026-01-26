@@ -24,13 +24,13 @@ func main() {
 	buf := make([]byte, 2048)
 	for {
 		fmt.Println("in for loop")
-		n, clientAddr, err := conn.ReadFromUDP(buf)
+		_, clientAddr, err := conn.ReadFromUDP(buf)
 		if err != nil {
 			fmt.Println("Error reading:", err)
 			continue
 		}
 
-		fmt.Printf("Received %d bytes from %v: %s\n", n, clientAddr, string(buf[:n]))
+		// fmt.Printf("Received %d bytes from %v: \n", n, clientAddr, buf[:10])
 		switch common.MessageType(buf[0]) {
 		case common.KeyExchangeMsg:
 			{
@@ -40,7 +40,7 @@ func main() {
 					panic(err)
 				}
 				sharedKey := exchangeKeys(conn, clientAddr, clientPubKey)
-				fmt.Println("server shared key is ", string(sharedKey))
+				fmt.Println("server shared key is ", sharedKey)
 				connections[clientAddr] = sharedKey
 			}
 		case common.PacketMsg:
@@ -67,7 +67,7 @@ func handleConnection(conn net.Conn) {
 	}
 
 	// Print the received data as a string
-	fmt.Printf("Received %d bytes: %s\n", n, string(buf[:n]))
+	fmt.Printf("Received %d bytes: %s\n", n, string(buf[:10]))
 }
 
 func tunHandler(tun tun.Device) {
@@ -92,7 +92,7 @@ func tunHandler(tun tun.Device) {
 			// Each packet is in bufs[i][tunOffset : tunOffset+sizes[i]]
 			packet := bufs[i][0 : 0+sizes[i]]
 
-			fmt.Println("server tun packet read: ", packet)
+			fmt.Println("server tun packet read: ", packet[0:10])
 		}
 	}
 }
@@ -122,6 +122,8 @@ func exchangeKeys(conn *net.UDPConn, clientAddr *net.UDPAddr, clientPubKey *ecdh
 	}
 	return sharedKey
 }
+
+// docker run --name vpn-server-cont --network vpn-network vpn-server
 
 // this code can be tested using
 // sudo ifconfig utun6 10.0.0.1 10.0.0.2

@@ -37,6 +37,7 @@ func main() {
 	}
 
 	tun := SetupTunInterface(tunIface)
+	fmt.Println("after seetup")
 	defer RestoreNetworkSettings(tun, dr)
 	handleOutgoingPackets(tun, sharedKey, server)
 }
@@ -76,9 +77,8 @@ func handleOutgoingPackets(tunDev tun.Device, key []byte, server net.Conn) {
 			panic(err)
 		}
 
-		fmt.Println("packet was read in client")
-		fmt.Println(bufs[0])
-		// go handlePacket(bufs[0], key, server)
+		fmt.Printf("packetin TUN was read in client %b\n", bufs[0][0:5])
+		go handlePacket(bufs[0], key, server)
 	}
 
 }
@@ -113,16 +113,31 @@ func SetupTunInterface(tunName string) tun.Device {
 	if err != nil {
 		panic(err)
 	}
-	common.SetDefaultRoute([]string{"default", "dev", tunName})
+	fmt.Println("ccalling set default")
+	err = common.SetDefaultRoute([]string{"default", "dev", tunName})
+	if err != nil {
+		panic(err)
+	}
 	return dev
 }
 
 func RestoreNetworkSettings(tunDevice tun.Device, defaultRoute []string) {
+	fmt.Println("before restore")
+	printIpRoute()
 	tunDevice.Close()
 	if defaultRoute != nil {
-
+		common.SetDefaultRoute(defaultRoute)
 	}
-	common.SetDefaultRoute(defaultRoute)
+	fmt.Println("after restore")
+	printIpRoute()
+}
+
+func printIpRoute() {
+	out, err := exec.Command("ip", "route", "show", "default").Output()
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(string(out))
 }
 
 // this code can be tested using
