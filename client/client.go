@@ -11,7 +11,7 @@ import (
 	"golang.zx2c4.com/wireguard/tun"
 )
 
-const macOsTunOffset = 4
+const tunOffset = 0
 const mtu = 1500 // maximum transmission unit = the largest size of single packet
 const address = "vpn-server-cont"
 const port = 8000
@@ -53,32 +53,30 @@ func connectToServer() net.Conn {
 	return conn
 }
 
-func handlePacket(packet []byte, key []byte, server net.Conn) {
-	nonce, encrypted := common.Encrypt(packet, key)
-	fmt.Println("client packet encrypted")
-	server.Write(append(nonce, encrypted...))
-	fmt.Println("client packet written")
-}
-
 func handleOutgoingPackets(tunDev tun.Device, key []byte, server net.Conn) {
-	numBuffers := 10
-	bufs := make([][]byte, numBuffers)
+	bufs := make([][]byte, 1)
+	bufs[0] = make([]byte, mtu)
+	sizes := make([]int, 1)
 
-	for i := range numBuffers {
-		bufs[i] = make([]byte, macOsTunOffset+mtu)
-	}
-
-	sizes := make([]int, numBuffers)
-
-	fmt.Println("before for loop")
 	for {
-		_, err := tunDev.Read(bufs, sizes, macOsTunOffset)
+		// TODO take advantage of batch read
+		packetsRead, err := tunDev.Read(bufs, sizes, tunOffset)
 		if err != nil {
 			panic(err)
 		}
 
-		fmt.Printf("packetin TUN was read in client %b\n", bufs[0][0:5])
-		go handlePacket(bufs[0], key, server)
+		bytesRead := sizes[0]
+		fmt.Println("packetsRead is: ", packetsRead)
+		fmt.Println("bytesRead is: ", sizes[0])
+		common.PrintParsedPacket(bufs[0][:bytesRead])
+
+		nonce, encrypted := common.Encrypt(bufs[0][:bytesRead], key)
+		fmt.Println("nonce lenght is ", len(nonce))
+		fmt.Println("nonce is ", nonce)
+		msg := append([]byte{byte(common.PacketMsg)}, nonce...) // append nonce
+		msg = append(msg, encrypted...)
+		fmt.Println("len msg is ", len(msg))
+		server.Write(msg)
 	}
 
 }
@@ -140,6 +138,7 @@ func printIpRoute() {
 	fmt.Println(string(out))
 }
 
+// docker run --name vpn-client-cont --network vpn-network vpn-client
 // this code can be tested using
 // sudo ifconfig utun7 10.0.0.1 10.0.0.2
 // ping -c 1 10.0.0.2

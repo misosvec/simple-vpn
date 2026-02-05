@@ -4,32 +4,42 @@ import (
 	"crypto/ecdh"
 	"fmt"
 	"net"
+	"strconv"
 	"vpn/common"
 
 	"golang.zx2c4.com/wireguard/tun"
 )
 
+// TODO offset 0 nor 4 did not work
+const tunOffset = 10
 const tunIface = "tun8"
 const mtu = 1500
+const nonceLenght = 12
+
+func DestroyTun(tun tun.Device, tunIface string) {
+	fmt.Println("defer: destroying TUN")
+	tun.Close()
+	common.DeleteInterface(tunIface)
+}
 
 func main() {
-	connections := make(map[*net.UDPAddr][]byte)
-	tun := common.CreateTunInterface(tunIface, mtu)
-	defer tun.Close()
+	connections := make(map[string][]byte)
 
-	go tunHandler(tun)
 	conn := startUdpServer("0.0.0.0:8000")
 	defer conn.Close()
+	tun := common.CreateTunInterface(tunIface, mtu)
+	go readTun(tun)
+	defer DestroyTun(tun, tunIface)
 
 	buf := make([]byte, 2048)
 	for {
-		fmt.Println("in for loop")
-		_, clientAddr, err := conn.ReadFromUDP(buf)
+		bytesRead, clientAddr, err := conn.ReadFromUDP(buf)
+		clientIp := clientAddr.IP.String() + ":" + strconv.Itoa(clientAddr.Port)
+		fmt.Println("bytesRead: ", bytesRead)
 		if err != nil {
 			fmt.Println("Error reading:", err)
 			continue
 		}
-
 		// fmt.Printf("Received %d bytes from %v: \n", n, clientAddr, buf[:10])
 		switch common.MessageType(buf[0]) {
 		case common.KeyExchangeMsg:
@@ -41,59 +51,59 @@ func main() {
 				}
 				sharedKey := exchangeKeys(conn, clientAddr, clientPubKey)
 				fmt.Println("server shared key is ", sharedKey)
-				connections[clientAddr] = sharedKey
+				connections[clientIp] = sharedKey
+				fmt.Printf("clientAddr value=%v pointer=%p\n", clientAddr, clientAddr)
+				fmt.Println("address %v and key is %v ", clientAddr, sharedKey)
 			}
 		case common.PacketMsg:
 			{
 				fmt.Println("received PackedMsg")
+				nonce := buf[1 : 1+nonceLenght]
+				key := connections[clientIp]
+
+				decrypted, err := common.Decrypt(nonce, buf[1+nonceLenght:bytesRead], key)
+				if err != nil {
+					panic(err)
+				}
+				fmt.Println("bytes readis ", bytesRead)
+				fmt.Println("decrypted len is ", decrypted)
+
+				buf := make([]byte, tunOffset+len(decrypted))
+				copy(buf[tunOffset:], decrypted)
+
+				written, err := tun.Write([][]byte{buf}, tunOffset)
+				if err != nil {
+					panic(err)
+				}
+				fmt.Println("packet written to TUN", written)
+				common.PrintParsedPacket(decrypted)
+			}
+		default:
+			{
+				fmt.Println("defautl receiviedd")
 			}
 		}
 	}
 }
 
-func handleConnection(conn net.Conn) {
-	defer conn.Close()
-
-	fmt.Println("Handling connection...")
-
-	// Make a buffer to hold incoming data
-	buf := make([]byte, 1024) // 1KB buffer
-
-	// Read data from the connection
-	n, err := conn.Read(buf)
-	if err != nil {
-		fmt.Println("Error reading:", err)
-		return
-	}
-
-	// Print the received data as a string
-	fmt.Printf("Received %d bytes: %s\n", n, string(buf[:10]))
-}
-
-func tunHandler(tun tun.Device) {
-	numBuffers := 10
-	bufs := make([][]byte, numBuffers)
-	sizes := make([]int, numBuffers)
-
-	for i := 0; i < numBuffers; i++ {
-		bufs[i] = make([]byte, 1500)
-	}
-
-	fmt.Println("Listening on TUN interface utun6...")
+func readTun(tun tun.Device) {
+	bufs := make([][]byte, 1)
+	bufs[0] = make([]byte, mtu)
+	sizes := make([]int, 1)
 
 	for {
-		// Keep reading packets in a loop
-		n, err := tun.Read(bufs, sizes, 0)
+		// TODO take advantage of batch read
+		packetsRead, err := tun.Read(bufs, sizes, tunOffset)
 		if err != nil {
 			panic(err)
 		}
 
-		for i := 0; i < n; i++ {
-			// Each packet is in bufs[i][tunOffset : tunOffset+sizes[i]]
-			packet := bufs[i][0 : 0+sizes[i]]
+		bytesRead := sizes[0]
+		fmt.Println("TUN server packetsRead is: ", packetsRead)
+		fmt.Println("tun serverr bytesRead is: ", sizes[0])
+		fmt.Println("TUN serrver received packet: ")
+		common.PrintParsedPacket(bufs[0][tunOffset : tunOffset+bytesRead])
 
-			fmt.Println("server tun packet read: ", packet[0:10])
-		}
 	}
 }
 
@@ -122,9 +132,3 @@ func exchangeKeys(conn *net.UDPConn, clientAddr *net.UDPAddr, clientPubKey *ecdh
 	}
 	return sharedKey
 }
-
-// docker run --name vpn-server-cont --network vpn-network vpn-server
-
-// this code can be tested using
-// sudo ifconfig utun6 10.0.0.1 10.0.0.2
-// ping -c 1 10.0.0.2
