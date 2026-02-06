@@ -127,27 +127,13 @@ func SetDefaultRoute(route []string) error {
 	return nil
 }
 
-// the wireguaard library will be used instead to handle this
-// func CreateTunInterface(tunName string) error {
-// 	err := exec.Command("ip", "tuntap", "add", "dev", tunName, "mode", "tun").Run()
-// 	if err != nil {
-// 		return fmt.Errorf("Failed to create %q interface: %w", tunName, err)
-// 	}
-
-// 	err = exec.Command("ip", "link", "set", "dev", tunName, "up").Run()
-// 	if err != nil {
-// 		return fmt.Errorf("Failed to enable %q interface: %w", tunName, err)
-// 	}
-
-// 	return nil
-// }
-
-func CreateTunInterface(iface string, mtu int) tun.Device {
-	dev, err := tun.CreateTUN(iface, mtu)
+func SetupTunInterface(tunName string, mtu int) tun.Device {
+	dev, err := tun.CreateTUN(tunName, mtu)
 	if err != nil {
 		panic(err)
 	}
-	err = exec.Command("ip", "link", "set", iface, "up").Run()
+
+	err = exec.Command("ip", "link", "set", tunName, "up").Run()
 	if err != nil {
 		panic(err)
 	}
@@ -160,4 +146,35 @@ func DeleteInterface(iface string) error {
 		return fmt.Errorf("Failed to delete %q interface: %w", iface, err)
 	}
 	return nil
+}
+
+func EnableIpForwarding() {
+	// TODO this changes last only until reboot
+	output, err := exec.Command("sudo", "sysctl", "-w", "net.ipv6.conf.all.forwarding=1").CombinedOutput()
+	if err != nil {
+		fmt.Println(string(output))
+		panic(err)
+	}
+
+	output, err = exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").CombinedOutput()
+	if err != nil {
+		fmt.Println(string(output))
+		panic(err)
+	}
+}
+
+func SetIpAddress(addr string, iface string) {
+	output, err := exec.Command("ip", "addr", "add", addr, "dev", iface).CombinedOutput()
+	if err != nil {
+		fmt.Println(string(output))
+		panic(err)
+	}
+}
+
+func EnablePostrouting(subnet string) {
+	output, err := exec.Command("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", subnet, "-o", "eth0", "-j", "MASQUERADE").CombinedOutput()
+	if err != nil {
+		fmt.Println(string(output))
+		panic(err)
+	}
 }

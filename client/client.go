@@ -36,7 +36,9 @@ func main() {
 		panic(err)
 	}
 
-	tun := SetupTunInterface(tunIface)
+	tun := common.SetupTunInterface(tunIface, mtu)
+	common.SetDefaultRoute([]string{"default", "dev", tunIface})
+	common.SetIpAddress("12.0.0.2/24", tunIface)
 	fmt.Println("after seetup")
 	defer RestoreNetworkSettings(tun, dr)
 	handleOutgoingPackets(tun, sharedKey, server)
@@ -100,23 +102,6 @@ func exchangeKeys(server net.Conn, clientPubKey *ecdh.PublicKey) (*ecdh.PublicKe
 	}
 
 	return nil, fmt.Errorf("Failed to exchange encryption keys, try again later.")
-}
-
-func SetupTunInterface(tunName string) tun.Device {
-	dev, err := tun.CreateTUN(tunName, mtu)
-	if err != nil {
-		panic(err)
-	}
-	err = exec.Command("ip", "link", "set", tunName, "up").Run()
-	if err != nil {
-		panic(err)
-	}
-	fmt.Println("ccalling set default")
-	err = common.SetDefaultRoute([]string{"default", "dev", tunName})
-	if err != nil {
-		panic(err)
-	}
-	return dev
 }
 
 func RestoreNetworkSettings(tunDevice tun.Device, defaultRoute []string) {

@@ -27,7 +27,10 @@ func main() {
 
 	conn := startUdpServer("0.0.0.0:8000")
 	defer conn.Close()
-	tun := common.CreateTunInterface(tunIface, mtu)
+
+	tun := common.SetupTunInterface(tunIface, mtu)
+	common.SetIpAddress("12.0.0.1/24", tunIface)
+	common.EnablePostrouting("12.0.0.0/24")
 	go readTun(tun)
 	defer DestroyTun(tun, tunIface)
 
