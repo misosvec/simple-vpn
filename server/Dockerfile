@@ -2,7 +2,7 @@ FROM golang:1.25-alpine
 
 RUN apk add --no-cache bash tcpdump iproute2 curl iptables ip6tables
 
-RUN go install github.com/air-verse/air@latest
+RUN GOOS=linux GOARCH=amd64 go install github.com/air-verse/air@latest
 
 WORKDIR /app
 

@@ -23,7 +23,7 @@ func DestroyTun(tun tun.Device, tunIface string) {
 }
 
 func main() {
-	connections := make(map[string][]byte)
+	clients := make(map[string]Client)
 
 	conn := startUdpServer("0.0.0.0:8000")
 	defer conn.Close()
@@ -31,14 +31,13 @@ func main() {
 	tun := common.SetupTunInterface(tunIface, mtu)
 	common.SetIpAddress("12.0.0.1/24", tunIface)
 	common.EnablePostrouting("12.0.0.0/24")
-	go readTun(tun)
 	defer DestroyTun(tun, tunIface)
 
 	buf := make([]byte, 2048)
 	for {
 		bytesRead, clientAddr, err := conn.ReadFromUDP(buf)
 		clientIp := clientAddr.IP.String() + ":" + strconv.Itoa(clientAddr.Port)
-		fmt.Println("bytesRead: ", bytesRead)
+		fmt.Println("udp bytesRead: ", bytesRead)
 		if err != nil {
 			fmt.Println("Error reading:", err)
 			continue
@@ -54,7 +53,8 @@ func main() {
 				}
 				sharedKey := exchangeKeys(conn, clientAddr, clientPubKey)
 				fmt.Println("server shared key is ", sharedKey)
-				connections[clientIp] = sharedKey
+				clients[clientIp] = Client{clientAddr, sharedKey}
+				go readTun(tun, conn, Client{clientAddr, sharedKey})
 				fmt.Printf("clientAddr value=%v pointer=%p\n", clientAddr, clientAddr)
 				fmt.Println("address %v and key is %v ", clientAddr, sharedKey)
 			}
@@ -62,9 +62,9 @@ func main() {
 			{
 				fmt.Println("received PackedMsg")
 				nonce := buf[1 : 1+nonceLenght]
-				key := connections[clientIp]
+				client := clients[clientIp]
 
-				decrypted, err := common.Decrypt(nonce, buf[1+nonceLenght:bytesRead], key)
+				decrypted, err := common.Decrypt(nonce, buf[1+nonceLenght:bytesRead], client.Key)
 				if err != nil {
 					panic(err)
 				}
@@ -78,6 +78,7 @@ func main() {
 				if err != nil {
 					panic(err)
 				}
+
 				fmt.Println("packet written to TUN", written)
 				common.PrintParsedPacket(decrypted)
 			}
@@ -89,7 +90,7 @@ func main() {
 	}
 }
 
-func readTun(tun tun.Device) {
+func readTun(tun tun.Device, conn *net.UDPConn, client Client) {
 	bufs := make([][]byte, 1)
 	bufs[0] = make([]byte, mtu)
 	sizes := make([]int, 1)
@@ -106,6 +107,10 @@ func readTun(tun tun.Device) {
 		fmt.Println("tun serverr bytesRead is: ", sizes[0])
 		fmt.Println("TUN serrver received packet: ")
 		common.PrintParsedPacket(bufs[0][tunOffset : tunOffset+bytesRead])
+		nonce, encrypted := common.Encrypt(bufs[0][tunOffset:tunOffset+bytesRead], client.Key)
+		msg := common.CreateMessage(common.PacketMsg, nonce, encrypted)
+		conn.WriteToUDP(msg, client.Addr)
+		fmt.Println("packet send back to client")
 
 	}
 }

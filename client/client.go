@@ -11,11 +11,12 @@ import (
 	"golang.zx2c4.com/wireguard/tun"
 )
 
-const tunOffset = 0
+const tunOffset = 10
 const mtu = 1500 // maximum transmission unit = the largest size of single packet
 const address = "vpn-server-cont"
 const port = 8000
 const tunIface = "tun7"
+const nonceLength = 12
 
 func main() {
 	clientPrivKey, clientPubKey := common.GeneratePubPrivKeys()
@@ -41,6 +42,7 @@ func main() {
 	common.SetIpAddress("12.0.0.2/24", tunIface)
 	fmt.Println("after seetup")
 	defer RestoreNetworkSettings(tun, dr)
+	go readFromVpnServer(server, sharedKey, tun)
 	handleOutgoingPackets(tun, sharedKey, server)
 }
 
@@ -72,13 +74,57 @@ func handleOutgoingPackets(tunDev tun.Device, key []byte, server net.Conn) {
 		fmt.Println("bytesRead is: ", sizes[0])
 		common.PrintParsedPacket(bufs[0][:bytesRead])
 
-		nonce, encrypted := common.Encrypt(bufs[0][:bytesRead], key)
+		// ONLY encrypt the actual packet data, starting from the offset
+		actualPacket := bufs[0][tunOffset : tunOffset+bytesRead]
+		nonce, encrypted := common.Encrypt(actualPacket, key)
 		fmt.Println("nonce lenght is ", len(nonce))
 		fmt.Println("nonce is ", nonce)
 		msg := append([]byte{byte(common.PacketMsg)}, nonce...) // append nonce
 		msg = append(msg, encrypted...)
 		fmt.Println("len msg is ", len(msg))
 		server.Write(msg)
+	}
+
+}
+
+func readFromVpnServer(server net.Conn, key []byte, tun tun.Device) {
+	buf := make([]byte, mtu)
+	fmt.Println("CLIENT, readding from server")
+	for {
+		bytesRead, err := server.Read(buf)
+
+		messageType := common.GetMessageType(buf)
+		switch messageType {
+		case common.KeyExchangeMsg:
+			{
+				// TODO
+			}
+		case common.PacketMsg:
+			{
+				nonce := buf[1 : 1+nonceLength]
+				packet := buf[1+nonceLength : bytesRead]
+				decrypted, err := common.Decrypt(nonce, packet, key)
+				if err != nil {
+					panic(err)
+				}
+
+				fmt.Println("received packet from server")
+				common.PrintParsedPacket(decrypted)
+				tunBuf := make([]byte, tunOffset+len(decrypted))
+				copy(tunBuf[tunOffset:], decrypted)
+
+				_, err = tun.Write([][]byte{tunBuf}, tunOffset)
+				if err != nil {
+					panic(err)
+				}
+
+			}
+
+		}
+
+		if err != nil {
+			panic(err)
+		}
 	}
 
 }
