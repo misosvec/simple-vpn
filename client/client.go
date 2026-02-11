@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/ecdh"
 	"fmt"
+	"log/slog"
 	"net"
 	"os/exec"
 	"strconv"
@@ -18,7 +19,11 @@ const port = 8000
 const tunIface = "tun7"
 const nonceLength = 12
 
+var logger *slog.Logger
+
 func main() {
+	logger = common.NewLogger(slog.LevelDebug)
+
 	clientPrivKey, clientPubKey := common.GeneratePubPrivKeys()
 	server := connectToServer()
 	serverPubKey, err := exchangeKeys(server, clientPubKey)
@@ -118,6 +123,11 @@ func readFromVpnServer(server net.Conn, key []byte, tun tun.Device) {
 					panic(err)
 				}
 
+			}
+		case common.HeartbeatMsg:
+			{
+				server.Write(common.NewMessage(common.HeartbeatMsg, []byte("OK")))
+				logger.Info("heartbeat sent")
 			}
 
 		}

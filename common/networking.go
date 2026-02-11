@@ -93,7 +93,6 @@ func PrintParsedPacket(raw []byte) {
 		return
 	}
 
-	// Default: just show IPs
 	fmt.Printf("%s -> %s\n", srcIP, dstIP)
 }
 

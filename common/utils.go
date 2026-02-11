@@ -1,7 +1,23 @@
 package common
 
-func CreateMessage(mt MessageType, nonce []byte, content []byte) []byte {
-	msg := append([]byte{byte(mt)}, nonce...)
-	msg = append(msg, content...)
+import (
+	"log/slog"
+	"os"
+)
+
+func NewMessage(mt MessageType, parts ...[]byte) []byte {
+	msg := []byte{byte(mt)}
+
+	for _, part := range parts {
+		msg = append(msg, part...)
+	}
+
 	return msg
+}
+
+func NewLogger(level slog.Level) *slog.Logger {
+	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		AddSource: true,
+		Level:     level,
+	}))
 }
