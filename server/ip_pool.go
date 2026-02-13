@@ -19,7 +19,7 @@ func NewPool(cidr string) *IpPool {
 	return &IpPool{
 		prefix:    prefix,
 		allocated: make(map[netip.Addr]struct{}),
-		next:      prefix.Masked().Addr(),
+		next:      prefix.Masked().Addr().Next(),
 	}
 }
 
@@ -31,6 +31,8 @@ func (p *IpPool) Allocate() *netip.Addr {
 		if !ip.IsValid() || !p.prefix.Contains(ip) {
 			ip = p.prefix.Masked().Addr().Next()
 		}
+
+		// TODO check for network and broadcast IP
 
 		if _, used := p.allocated[ip]; !used {
 			p.allocated[ip] = struct{}{}

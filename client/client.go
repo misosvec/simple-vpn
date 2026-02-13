@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os/exec"
 	"strconv"
+	"time"
 	"vpn/common"
 
 	"golang.zx2c4.com/wireguard/tun"
@@ -20,35 +22,40 @@ const tunIface = "tun7"
 const nonceLength = 12
 
 var logger *slog.Logger
+var keyLength int
+var clientPrivKey *ecdh.PrivateKey
+var sharedKey []byte
+var clientReady bool = false
 
 func main() {
 	logger = common.NewLogger(slog.LevelDebug)
-
-	clientPrivKey, clientPubKey := common.GeneratePubPrivKeys()
 	server := connectToServer()
-	serverPubKey, err := exchangeKeys(server, clientPubKey)
+
+	tunDev, err := common.SetupTunInterface(tunIface, mtu)
 	if err != nil {
 		panic(err)
 	}
-	sharedKey, err := clientPrivKey.ECDH(serverPubKey)
+	time.Sleep(100 * time.Millisecond)
+
+	err = common.SetDefaultRoute([]string{"default", "dev", tunIface})
 	if err != nil {
 		panic(err)
 	}
 
-	fmt.Println("client shared key is ", sharedKey)
+	var clientPubKey *ecdh.PublicKey
+	clientPrivKey, clientPubKey = common.GeneratePubPrivKeys()
+	server.Write(append([]byte{byte(common.KeyExchangeMsg)}, clientPubKey.Bytes()...))
+	keyLength = len(clientPubKey.Bytes())
 
 	dr, err := common.GetDefaultRoute()
 	if err != nil {
 		panic(err)
 	}
 
-	tun := common.SetupTunInterface(tunIface, mtu)
-	common.SetDefaultRoute([]string{"default", "dev", tunIface})
-	common.SetIpAddress("12.0.0.2/24", tunIface)
 	fmt.Println("after seetup")
-	defer RestoreNetworkSettings(tun, dr)
-	go readFromVpnServer(server, sharedKey, tun)
-	handleOutgoingPackets(tun, sharedKey, server)
+	defer RestoreNetworkSettings(tunDev, dr)
+	go readFromVpnServer(server, tunDev)
+	handleOutgoingPackets(tunDev, server)
 }
 
 func connectToServer() net.Conn {
@@ -62,7 +69,7 @@ func connectToServer() net.Conn {
 	return conn
 }
 
-func handleOutgoingPackets(tunDev tun.Device, key []byte, server net.Conn) {
+func handleOutgoingPackets(tunDev tun.Device, server net.Conn) {
 	bufs := make([][]byte, 1)
 	bufs[0] = make([]byte, mtu)
 	sizes := make([]int, 1)
@@ -70,6 +77,9 @@ func handleOutgoingPackets(tunDev tun.Device, key []byte, server net.Conn) {
 	for {
 		// TODO take advantage of batch read
 		packetsRead, err := tunDev.Read(bufs, sizes, tunOffset)
+		if len(sharedKey) == 0 || !clientReady {
+			continue
+		}
 		if err != nil {
 			panic(err)
 		}
@@ -77,13 +87,17 @@ func handleOutgoingPackets(tunDev tun.Device, key []byte, server net.Conn) {
 		bytesRead := sizes[0]
 		fmt.Println("packetsRead is: ", packetsRead)
 		fmt.Println("bytesRead is: ", sizes[0])
-		common.PrintParsedPacket(bufs[0][:bytesRead])
 
 		// ONLY encrypt the actual packet data, starting from the offset
 		actualPacket := bufs[0][tunOffset : tunOffset+bytesRead]
-		nonce, encrypted := common.Encrypt(actualPacket, key)
-		fmt.Println("nonce lenght is ", len(nonce))
-		fmt.Println("nonce is ", nonce)
+
+		ipVersion := actualPacket[0] >> 4
+		if ipVersion == 6 {
+			logger.Debug("Dropping IPv6 packet - VPN is IPv4 only")
+			continue
+		}
+		common.PrintParsedPacket(actualPacket)
+		nonce, encrypted := common.Encrypt(actualPacket, sharedKey)
 		msg := append([]byte{byte(common.PacketMsg)}, nonce...) // append nonce
 		msg = append(msg, encrypted...)
 		fmt.Println("len msg is ", len(msg))
@@ -92,7 +106,7 @@ func handleOutgoingPackets(tunDev tun.Device, key []byte, server net.Conn) {
 
 }
 
-func readFromVpnServer(server net.Conn, key []byte, tun tun.Device) {
+func readFromVpnServer(server net.Conn, tun tun.Device) {
 	buf := make([]byte, mtu)
 	fmt.Println("CLIENT, readding from server")
 	for {
@@ -102,13 +116,48 @@ func readFromVpnServer(server net.Conn, key []byte, tun tun.Device) {
 		switch messageType {
 		case common.KeyExchangeMsg:
 			{
-				// TODO
+				fmt.Println("rreceived a key echange from server")
+				fmt.Println("buffer is ", buf[0:50])
+				fmt.Println("key is ", buf[1:keyLength+1])
+				serverPubKey, err := ecdh.X25519().NewPublicKey(buf[1 : keyLength+1])
+				if err != nil {
+					panic(err)
+				}
+				sharedKey, err = clientPrivKey.ECDH(serverPubKey)
+				fmt.Println("shared key is ", sharedKey)
+			}
+		case common.VirtualIpMsg:
+			{
+				assignedIp, ok := netip.AddrFromSlice(buf[1:5])
+				ipMasked := netip.PrefixFrom(assignedIp, int(buf[5]))
+
+				if !ok {
+					panic("TODO")
+				}
+				logger.Debug("recevied ip form server", ipMasked.String())
+				// out, err := exec.Command("ip", "addr", "show", "dev", "tun7").Output()
+				// if err != nil {
+				// 	panic(err)
+				// }
+				// fmt.Println(string(out))
+				//
+				//
+				//
+				tunName, err := tun.Name()
+				if err != nil {
+					panic(err)
+				}
+				fmt.Println("tun name is ", tunName)
+				common.SetIpAddress(ipMasked.String(), tunName)
+
+				clientReady = true
+				server.Write(common.NewMessage(common.ClientReadyMsg))
 			}
 		case common.PacketMsg:
 			{
 				nonce := buf[1 : 1+nonceLength]
 				packet := buf[1+nonceLength : bytesRead]
-				decrypted, err := common.Decrypt(nonce, packet, key)
+				decrypted, err := common.Decrypt(nonce, packet, sharedKey)
 				if err != nil {
 					panic(err)
 				}
@@ -129,7 +178,6 @@ func readFromVpnServer(server net.Conn, key []byte, tun tun.Device) {
 				server.Write(common.NewMessage(common.HeartbeatMsg, []byte("OK")))
 				logger.Info("heartbeat sent")
 			}
-
 		}
 
 		if err != nil {
@@ -137,27 +185,6 @@ func readFromVpnServer(server net.Conn, key []byte, tun tun.Device) {
 		}
 	}
 
-}
-
-func exchangeKeys(server net.Conn, clientPubKey *ecdh.PublicKey) (*ecdh.PublicKey, error) {
-	server.Write(append([]byte{byte(common.KeyExchangeMsg)}, clientPubKey.Bytes()...))
-	keyLength := len(clientPubKey.Bytes())
-
-	buf := make([]byte, keyLength+1)
-	_, err := server.Read(buf)
-	if err != nil {
-		return nil, err
-	}
-
-	if common.GetMessageType(buf) == common.KeyExchangeMsg {
-		serverPubKey, err := ecdh.X25519().NewPublicKey(buf[1 : keyLength+1])
-		if err != nil {
-			return nil, err
-		}
-		return serverPubKey, nil
-	}
-
-	return nil, fmt.Errorf("Failed to exchange encryption keys, try again later.")
 }
 
 func RestoreNetworkSettings(tunDevice tun.Device, defaultRoute []string) {

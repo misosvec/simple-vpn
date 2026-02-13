@@ -22,13 +22,13 @@ func (c *Client) sendHeartbeat(conn *net.UDPConn) {
 }
 
 func (c *Client) startHeartbeat(ctx context.Context, conn *net.UDPConn) {
-	ticker := time.NewTicker(time.Duration(time.Duration.Seconds(20)))
+	ticker := time.NewTicker(20 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			if time.Since(c.LastSeen) >= time.Duration(time.Duration.Seconds(20)) {
+			if time.Since(c.LastSeen) >= time.Duration(20*time.Second) {
 				c.sendHeartbeat(conn)
 			}
 		case <-ctx.Done():

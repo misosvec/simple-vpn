@@ -126,17 +126,19 @@ func SetDefaultRoute(route []string) error {
 	return nil
 }
 
-func SetupTunInterface(tunName string, mtu int) tun.Device {
+func SetupTunInterface(tunName string, mtu int) (tun.Device, error) {
 	dev, err := tun.CreateTUN(tunName, mtu)
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
+
+	fmt.Println("TUN device created:", tunName)
 
 	err = exec.Command("ip", "link", "set", tunName, "up").Run()
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
-	return dev
+	return dev, nil
 }
 
 func DeleteInterface(iface string) error {
