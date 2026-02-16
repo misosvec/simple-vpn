@@ -12,16 +12,11 @@ import (
 type Client struct {
 	Addr      *net.UDPAddr
 	Key       []byte
-	VirtualIP *netip.Addr
+	VirtualIP netip.Addr
 	LastSeen  time.Time
 }
 
-func (c *Client) sendHeartbeat(conn *net.UDPConn) {
-	conn.WriteToUDP([]byte("HB"), c.Addr)
-	fmt.Printf("Sent heartbeat to %s\n", c.Addr.String())
-}
-
-func (c *Client) startHeartbeat(ctx context.Context, conn *net.UDPConn) {
+func (c *Client) StartHeartbeat(ctx context.Context, sendHeartbeat func()) {
 	ticker := time.NewTicker(20 * time.Second)
 	defer ticker.Stop()
 
@@ -29,7 +24,7 @@ func (c *Client) startHeartbeat(ctx context.Context, conn *net.UDPConn) {
 		select {
 		case <-ticker.C:
 			if time.Since(c.LastSeen) >= time.Duration(20*time.Second) {
-				c.sendHeartbeat(conn)
+				sendHeartbeat()
 			}
 		case <-ctx.Done():
 			fmt.Printf("Stopping heartbeat for %s\n", c.Addr.String())
@@ -47,7 +42,7 @@ type ClientManager struct {
 	clients sync.Map
 }
 
-func (cm *ClientManager) AddClient(virtualIp netip.Addr, c *Client, conn *net.UDPConn) {
+func (cm *ClientManager) AddClient(virtualIp netip.Addr, c *Client, sendHeartbeat func()) {
 	ctx, cancel := context.WithCancel(context.Background())
 	mc := &ManagedClient{
 		Client: c,
@@ -55,7 +50,7 @@ func (cm *ClientManager) AddClient(virtualIp netip.Addr, c *Client, conn *net.UD
 	}
 	cm.clients.Store(virtualIp, mc)
 
-	go c.startHeartbeat(ctx, conn)
+	go c.StartHeartbeat(ctx, sendHeartbeat)
 }
 
 func (cm *ClientManager) GetClient(virtualIp netip.Addr) *Client {

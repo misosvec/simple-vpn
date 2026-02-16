@@ -23,7 +23,7 @@ func NewPool(cidr string) *IpPool {
 	}
 }
 
-func (p *IpPool) Allocate() *netip.Addr {
+func (p *IpPool) Allocate() netip.Addr {
 	ip := p.next
 
 	for {
@@ -37,7 +37,7 @@ func (p *IpPool) Allocate() *netip.Addr {
 		if _, used := p.allocated[ip]; !used {
 			p.allocated[ip] = struct{}{}
 			p.next = ip.Next()
-			return &ip
+			return ip
 		}
 
 		ip = ip.Next()

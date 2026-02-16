@@ -19,25 +19,19 @@ const tunIface = "tun8"
 const mtu = 1500
 const nonceLenght = 12
 
-func DestroyTun(tunIface string) {
-	fmt.Println("defer: destroying TUN")
-	tunDev.Close()
-	common.DeleteInterface(tunIface)
-}
-
 var logger *slog.Logger
 var server *net.UDPConn
 var cm ClientManager
 var tunDev tun.Device
 var ipPool *IpPool
 var pendingClients map[string]*Client
-var realToVirtual map[string]*netip.Addr
+var realToVirtual map[string]netip.Addr
 
 func main() {
 	logger = common.NewLogger(slog.LevelDebug)
 	ipPool = NewPool("12.0.0.1/24")
 	pendingClients = make(map[string]*Client)
-	realToVirtual = make(map[string]*netip.Addr)
+	realToVirtual = make(map[string]netip.Addr)
 	server = startUdpServer("0.0.0.0:8000")
 	defer server.Close()
 
@@ -46,12 +40,18 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	common.SetIpAddress("12.0.0.1/24", tunIface)
+	common.SetIpAddress("12.0.0.44/24", tunIface)
 	common.EnablePostrouting("12.0.0.0/24")
-	go readTun(server)
+	go readTun()
 	defer DestroyTun(tunIface)
 
 	readClientPackets()
+}
+
+func DestroyTun(tunIface string) {
+	fmt.Println("defer: destroying TUN")
+	tunDev.Close()
+	common.DeleteInterface(tunIface)
 }
 
 func readClientPackets() {
@@ -66,7 +66,7 @@ func readClientPackets() {
 	}
 }
 
-func readTun(conn *net.UDPConn) {
+func readTun() {
 	bufs := make([][]byte, 1)
 	bufs[0] = make([]byte, mtu)
 	sizes := make([]int, 1)
@@ -78,8 +78,15 @@ func readTun(conn *net.UDPConn) {
 			logger.Error("Failed to read ")
 			panic(err)
 		}
+
+		packet := common.NewTrafficPacket(bufs[0][tunOffset : tunOffset+sizes[0]])
+		// fmt.Println("TUN receviedd packet", )
+		if !common.FilterPacket(packet, ipPool.prefix) {
+			continue
+		}
+		fmt.Println("packet passed filter")
 		// here, the response packet is received from the internet, encrypt it and send back to cllient
-		go sendPacketToClient(bufs[0][tunOffset : tunOffset+sizes[0]])
+		go sendPacketToClient(packet)
 	}
 }
 
@@ -98,31 +105,34 @@ func startUdpServer(address string) *net.UDPConn {
 	return conn
 }
 
-func exchangeKeys(conn *net.UDPConn, clientAddr *net.UDPAddr, clientPubKey *ecdh.PublicKey) []byte {
-	serverPrivKey, serverPubKey := common.GeneratePubPrivKeys()
-	conn.WriteToUDP(append([]byte{byte(common.KeyExchangeMsg)}, serverPubKey.Bytes()...), clientAddr)
-	// conn.Write()
-	sharedKey, err := serverPrivKey.ECDH(clientPubKey)
-	if err != nil {
-		panic(err)
-	}
-	return sharedKey
-}
-
-func processClientPacket(packet []byte, clientAddr *net.UDPAddr) {
+func processClientPacket(buf []byte, clientAddr *net.UDPAddr) {
+	fmt.Println("buffer from client is ", buf[:20])
 	clientIp := clientAddr.IP.String() + ":" + strconv.Itoa(clientAddr.Port)
-	fmt.Println("client Ip is ", clientIp)
-	switch common.MessageType(packet[0]) {
-	case common.KeyExchangeMsg:
+
+	client := cm.GetClient(realToVirtual[clientIp])
+	var packet common.Packet
+	if client != nil {
+		packet, _ = common.ParsePacket(buf, client.Key)
+	} else {
+		packet, _ = common.ParsePacket(buf, nil)
+	}
+
+	switch p := packet.(type) {
+	case common.KeyExchangePacket:
 		{
 			logger.Info("Received KeyExchangeMsg from client", slog.String("clientIp", clientIp))
-			clientPubKey, err := ecdh.X25519().NewPublicKey(packet[1:33])
+
+			clientPubKey, err := ecdh.X25519().NewPublicKey(p.Key())
 			if err != nil {
 				panic(err)
 			}
-			sharedKey := exchangeKeys(server, clientAddr, clientPubKey)
-			clientVirtualIp := ipPool.Allocate()
 
+			serverPrivKey, serverPubKey := common.GeneratePubPrivKeys()
+			// TODO maybe I should create some confirmation that this was received
+			server.WriteToUDP(common.NewKeyExchangePacket(serverPubKey.Bytes()).Bytes(), clientAddr)
+			sharedKey, err := serverPrivKey.ECDH(clientPubKey)
+
+			clientVirtualIp := ipPool.Allocate()
 			client := Client{
 				Addr:      clientAddr,
 				Key:       sharedKey,
@@ -130,72 +140,60 @@ func processClientPacket(packet []byte, clientAddr *net.UDPAddr) {
 				VirtualIP: clientVirtualIp,
 			}
 
+			fmt.Println("sendding IP", clientVirtualIp.AsSlice())
+			fmt.Println("sendidng mask", byte(ipPool.prefix.Bits()))
 			realToVirtual[clientIp] = clientVirtualIp
-			fmt.Println("assigned IP is ", clientVirtualIp.String())
 			server.WriteToUDP(
-				common.NewMessage(
-					common.VirtualIpMsg,
+				common.NewVirtualIpPacket(
 					clientVirtualIp.AsSlice(),
 					[]byte{byte(ipPool.prefix.Bits())},
-				),
+				).BytesEncrypted(client.Key),
 				clientAddr,
 			)
 			pendingClients[clientIp] = &client
 		}
-	case common.ClientReadyMsg:
+	case common.ClientReadyPacket:
 		{
 			clientVirtualIp := realToVirtual[clientIp]
-
-			fmt.Println("client ready with ip ", clientAddr.String())
-			cm.AddClient(*clientVirtualIp, pendingClients[clientIp], server)
+			cm.AddClient(clientVirtualIp, pendingClients[clientIp], func() {
+				server.WriteToUDP(common.NewHeartbeatPacket().Bytes(), clientAddr)
+				logger.Debug("Heartbeat sent!", slog.String("clientIp", clientIp))
+			})
 			delete(pendingClients, clientIp)
+			logger.Debug("Client ready!", slog.String("clientIp", clientIp))
 		}
-	case common.PacketMsg:
+	case common.TrafficPacket:
 		{
-			fmt.Println("received PackedMsg")
-			nonce := packet[1 : 1+nonceLenght]
-			client := cm.GetClient(*realToVirtual[clientIp])
-			fmt.Println("packet msg client is ", client)
-			decrypted, err := common.Decrypt(nonce, packet[1+nonceLenght:], client.Key)
-			if err != nil {
-				panic(err)
-			}
-			fmt.Println("decrypted len is ", decrypted)
-
-			buf := make([]byte, tunOffset+len(decrypted))
-			copy(buf[tunOffset:], decrypted)
+			payload := make([]byte, tunOffset+p.DataLen())
+			copy(payload[tunOffset:], p.Data())
 
 			// inject packet for OS level routing
-			written, err := tunDev.Write([][]byte{buf}, tunOffset)
+			written, err := tunDev.Write([][]byte{payload}, tunOffset)
 			if err != nil {
 				panic(err)
 			}
 
 			fmt.Println("packet written to TUN", written)
-			common.PrintParsedPacket(decrypted)
+			common.PrintParsedPacket(p.Bytes())
 		}
-	case common.HeartbeatMsg:
+	case common.HeartbeatPacket:
 		{
-			cm.UpdateLastSeen(clientAddr.AddrPort().Addr())
-			logger.Info("heartbeat received", slog.String("clientIp", clientIp))
+			logger.Debug("Heartbeat received!", slog.String("clientIp", clientIp))
 		}
 	default:
 		{
-			fmt.Println("defautl receiviedd")
+			logger.Debug("Received messsage with unknown type!", slog.String("clientIp", clientIp))
 		}
 	}
+	cm.UpdateLastSeen(clientAddr.AddrPort().Addr())
 }
 
-func sendPacketToClient(packet []byte) {
-	common.PrintParsedPacket(packet)
-	destIp, ok := netip.AddrFromSlice(packet[16:20])
-	if !ok {
-		return
-	}
+func sendPacketToClient(p common.Packet) {
+	common.PrintParsedPacket(p.Data())
+	destIp := p.GetDestAddr()
 	fmt.Println("send packcet to clcient, ip is", destIp)
-	client := cm.GetClient(destIp)
-	nonce, encrypted := common.Encrypt(packet, client.Key)
-	_, err := server.WriteToUDP(common.NewMessage(common.PacketMsg, nonce, encrypted), client.Addr)
+	client := cm.GetClient(p.GetDestAddr())
+	_, err := server.WriteToUDP(p.BytesEncrypted(client.Key), client.Addr)
 	if err != nil {
 		logger.Error("Failed to send packet back to client", slog.String("error", err.Error()), slog.String("clientIp", client.Addr.IP.String()))
 		return
