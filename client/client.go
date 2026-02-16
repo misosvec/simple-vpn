@@ -71,13 +71,15 @@ func connectToServer() net.Conn {
 }
 
 func handleOutgoingPackets(tunDev tun.Device, server net.Conn) {
-	bufs := make([][]byte, 1)
-	bufs[0] = make([]byte, mtu)
-	sizes := make([]int, 1)
+	bufs := make([][]byte, 16)
+	for i := range bufs {
+		bufs[i] = make([]byte, mtu)
+	}
+	sizes := make([]int, 16)
 
 	for {
 		// TODO take advantage of batch read
-		_, err := tunDev.Read(bufs, sizes, tunOffset)
+		packetsRead, err := tunDev.Read(bufs, sizes, tunOffset)
 		if err != nil {
 			panic(err)
 		}
@@ -87,14 +89,16 @@ func handleOutgoingPackets(tunDev tun.Device, server net.Conn) {
 			continue
 		}
 
-		bytesRead := sizes[0]
-		packet := common.NewTrafficPacket(bufs[0][tunOffset : tunOffset+bytesRead])
-		if !common.FilterPacket(packet, hostIp) {
-			continue
+		for i := range packetsRead {
+			packet := common.NewTrafficPacket(bufs[i][tunOffset : tunOffset+sizes[i]])
+			if !common.FilterPacket(packet, hostIp) {
+				continue
+			}
+
+			common.PrintParsedPacket(packet.Data())
+			server.Write(packet.BytesEncrypted(sharedKey))
 		}
 
-		common.PrintParsedPacket(packet.Data())
-		server.Write(packet.BytesEncrypted(sharedKey))
 	}
 
 }

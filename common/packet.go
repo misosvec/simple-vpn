@@ -3,6 +3,7 @@ package common
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/netip"
 )
 
@@ -20,6 +21,11 @@ const (
 	TypeHeartbeat   PacketType = 4
 	TypeTraffic     PacketType = 5
 )
+
+type IncomingPacket struct {
+	Data []byte
+	Addr *net.UDPAddr
+}
 
 type PacketBase struct {
 	pt   PacketType

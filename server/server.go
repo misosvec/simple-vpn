@@ -17,7 +17,6 @@ import (
 const tunOffset = 10
 const tunIface = "tun8"
 const mtu = 1500
-const nonceLenght = 12
 
 var logger *slog.Logger
 var server *net.UDPConn
@@ -26,6 +25,8 @@ var tunDev tun.Device
 var ipPool *IpPool = NewIpPool("12.0.0.1/24")
 var pendingClients = common.NewConcurrentMap[string, *Client]()
 var realToVirtual = common.NewConcurrentMap[string, netip.Addr]()
+var packetChan = make(chan common.IncomingPacket, 2048)
+var trafficChan = make(chan common.Packet, 2048)
 
 func main() {
 	logger = common.NewLogger(slog.LevelDebug)
@@ -37,11 +38,13 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+
 	common.SetIpAddress("12.0.0.44/24", tunIface)
 	common.EnablePostrouting("12.0.0.0/24")
 	go readTun()
 	defer DestroyTun(tunIface)
-
+	go startWorkers(3, packetChan, processClientPacket)
+	go startWorkers(3, trafficChan, sendPacketToClient)
 	readClientPackets()
 }
 
@@ -59,31 +62,36 @@ func readClientPackets() {
 			logger.Error("Failed to read packet from client", slog.String("error", err.Error()))
 			continue
 		}
-		go processClientPacket(buf[:bytesRead], clientAddr)
+		packetChan <- common.IncomingPacket{
+			Data: buf[:bytesRead],
+			Addr: clientAddr,
+		}
 	}
 }
 
 func readTun() {
-	bufs := make([][]byte, 1)
-	bufs[0] = make([]byte, mtu)
-	sizes := make([]int, 1)
+	bufs := make([][]byte, 16)
+	for i := range bufs {
+		bufs[i] = make([]byte, mtu)
+	}
+	sizes := make([]int, 16)
 
 	for {
 		// TODO take advantage of batch read
-		_, err := tunDev.Read(bufs, sizes, tunOffset)
+		packetsRead, err := tunDev.Read(bufs, sizes, tunOffset)
 		if err != nil {
 			logger.Error("Failed to read ")
 			panic(err)
 		}
 
-		packet := common.NewTrafficPacket(bufs[0][tunOffset : tunOffset+sizes[0]])
-		// fmt.Println("TUN receviedd packet", )
-		if !common.FilterPacket(packet, ipPool.prefix) {
-			continue
+		for i := range packetsRead {
+			packet := common.NewTrafficPacket(bufs[i][tunOffset : tunOffset+sizes[i]])
+			// fmt.Println("TUN receviedd packet", )
+			if !common.FilterPacket(packet, ipPool.prefix) {
+				continue
+			}
+			trafficChan <- packet
 		}
-		fmt.Println("packet passed filter")
-		// here, the response packet is received from the internet, encrypt it and send back to cllient
-		go sendPacketToClient(packet)
 	}
 }
 
@@ -102,9 +110,8 @@ func startUdpServer(address string) *net.UDPConn {
 	return conn
 }
 
-func processClientPacket(buf []byte, clientAddr *net.UDPAddr) {
-	fmt.Println("buffer from client is ", buf[:20])
-	clientIp := clientAddr.IP.String() + ":" + strconv.Itoa(clientAddr.Port)
+func processClientPacket(incP common.IncomingPacket) {
+	clientIp := incP.Addr.IP.String() + ":" + strconv.Itoa(incP.Addr.Port)
 
 	clientVirtIp, ok := realToVirtual.Load(clientIp)
 	if !ok {
@@ -113,9 +120,9 @@ func processClientPacket(buf []byte, clientAddr *net.UDPAddr) {
 	client := cm.GetClient(clientVirtIp)
 	var packet common.Packet
 	if client != nil {
-		packet, _ = common.ParsePacket(buf, client.Key)
+		packet, _ = common.ParsePacket(incP.Data, client.Key)
 	} else {
-		packet, _ = common.ParsePacket(buf, nil)
+		packet, _ = common.ParsePacket(incP.Data, nil)
 	}
 
 	switch p := packet.(type) {
@@ -130,12 +137,12 @@ func processClientPacket(buf []byte, clientAddr *net.UDPAddr) {
 
 			serverPrivKey, serverPubKey := common.GeneratePubPrivKeys()
 			// TODO maybe I should create some confirmation that this was received
-			server.WriteToUDP(common.NewKeyExchangePacket(serverPubKey.Bytes()).Bytes(), clientAddr)
+			server.WriteToUDP(common.NewKeyExchangePacket(serverPubKey.Bytes()).Bytes(), incP.Addr)
 			sharedKey, err := serverPrivKey.ECDH(clientPubKey)
 
 			clientVirtualIp := ipPool.Allocate()
 			client := Client{
-				Addr:      clientAddr,
+				Addr:      incP.Addr,
 				Key:       sharedKey,
 				LastSeen:  time.Now(),
 				VirtualIP: clientVirtualIp,
@@ -149,7 +156,7 @@ func processClientPacket(buf []byte, clientAddr *net.UDPAddr) {
 					clientVirtualIp.AsSlice(),
 					[]byte{byte(ipPool.prefix.Bits())},
 				).BytesEncrypted(client.Key),
-				clientAddr,
+				incP.Addr,
 			)
 			pendingClients.Store(clientIp, &client)
 		}
@@ -166,7 +173,7 @@ func processClientPacket(buf []byte, clientAddr *net.UDPAddr) {
 			}
 
 			cm.AddClient(clientVirtualIp, pendingClient, func() {
-				server.WriteToUDP(common.NewHeartbeatPacket().Bytes(), clientAddr)
+				server.WriteToUDP(common.NewHeartbeatPacket().Bytes(), incP.Addr)
 				logger.Debug("Heartbeat sent!", slog.String("clientIp", clientIp))
 			})
 
@@ -210,4 +217,14 @@ func sendPacketToClient(p common.Packet) {
 		return
 	}
 	logger.Info("Packet sent to client", slog.String("clientIp", client.Addr.IP.String()))
+}
+
+func startWorkers[T any](n int, channel chan T, do func(t T)) {
+	for i := 0; i < n; i++ {
+		go func() {
+			for val := range channel {
+				do(val)
+			}
+		}()
+	}
 }
