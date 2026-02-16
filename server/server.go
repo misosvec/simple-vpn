@@ -23,13 +23,12 @@ var logger *slog.Logger
 var server *net.UDPConn
 var cm = NewClientManager()
 var tunDev tun.Device
-var ipPool *IpPool
+var ipPool *IpPool = NewIpPool("12.0.0.1/24")
 var pendingClients = common.NewConcurrentMap[string, *Client]()
 var realToVirtual = common.NewConcurrentMap[string, netip.Addr]()
 
 func main() {
 	logger = common.NewLogger(slog.LevelDebug)
-	ipPool = NewPool("12.0.0.1/24")
 	server = startUdpServer("0.0.0.0:8000")
 	defer server.Close()
 
@@ -197,7 +196,7 @@ func processClientPacket(buf []byte, clientAddr *net.UDPAddr) {
 			logger.Debug("Received messsage with unknown type!", slog.String("clientIp", clientIp))
 		}
 	}
-	cm.UpdateLastSeen(clientAddr.AddrPort().Addr())
+	cm.UpdateLastSeen(clientVirtIp)
 }
 
 func sendPacketToClient(p common.Packet) {

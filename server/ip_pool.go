@@ -2,15 +2,16 @@ package main
 
 import (
 	"net/netip"
+	"vpn/common"
 )
 
 type IpPool struct {
 	prefix    netip.Prefix
-	allocated map[netip.Addr]struct{}
+	allocated *common.ConcurrentMap[netip.Addr, struct{}]
 	next      netip.Addr
 }
 
-func NewPool(cidr string) *IpPool {
+func NewIpPool(cidr string) *IpPool {
 	prefix, err := netip.ParsePrefix(cidr)
 	if err != nil {
 		panic("TODO")
@@ -18,7 +19,7 @@ func NewPool(cidr string) *IpPool {
 
 	return &IpPool{
 		prefix:    prefix,
-		allocated: make(map[netip.Addr]struct{}),
+		allocated: common.NewConcurrentMap[netip.Addr, struct{}](),
 		next:      prefix.Masked().Addr().Next(),
 	}
 }
@@ -34,8 +35,8 @@ func (p *IpPool) Allocate() netip.Addr {
 
 		// TODO check for network and broadcast IP
 
-		if _, used := p.allocated[ip]; !used {
-			p.allocated[ip] = struct{}{}
+		if _, used := p.allocated.Load(ip); !used {
+			p.allocated.Store(ip, struct{}{})
 			p.next = ip.Next()
 			return ip
 		}
@@ -46,6 +47,6 @@ func (p *IpPool) Allocate() netip.Addr {
 
 func (p *IpPool) Release(ip netip.Addr) {
 	if p.prefix.Contains(ip) {
-		delete(p.allocated, ip)
+		p.allocated.Delete(ip)
 	}
 }
