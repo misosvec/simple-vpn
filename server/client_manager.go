@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
-	"sync"
 	"time"
+	"vpn/common"
 )
 
 type Client struct {
@@ -39,7 +39,13 @@ type ManagedClient struct {
 }
 
 type ClientManager struct {
-	clients sync.Map
+	clients *common.ConcurrentMap[netip.Addr, *ManagedClient]
+}
+
+func NewClientManager() *ClientManager {
+	return &ClientManager{
+		clients: common.NewConcurrentMap[netip.Addr, *ManagedClient](),
+	}
 }
 
 func (cm *ClientManager) AddClient(virtualIp netip.Addr, c *Client, sendHeartbeat func()) {
@@ -58,20 +64,18 @@ func (cm *ClientManager) GetClient(virtualIp netip.Addr) *Client {
 	if !ok {
 		return nil
 	}
-	return val.(*ManagedClient).Client
+	return val.Client
 }
 
 func (cm *ClientManager) RemoveClient(virtualIp netip.Addr) {
-	if val, ok := cm.clients.Load(virtualIp); ok {
-		mc := val.(*ManagedClient)
+	if mc, ok := cm.clients.Load(virtualIp); ok {
 		mc.Cancel()
 		cm.clients.Delete(virtualIp)
 	}
 }
 
 func (cm *ClientManager) UpdateLastSeen(virtualIp netip.Addr) {
-	if val, ok := cm.clients.Load(virtualIp); ok {
-		mc := val.(*ManagedClient)
+	if mc, ok := cm.clients.Load(virtualIp); ok {
 		mc.Client.LastSeen = time.Now()
 	}
 }

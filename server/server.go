@@ -21,17 +21,15 @@ const nonceLenght = 12
 
 var logger *slog.Logger
 var server *net.UDPConn
-var cm ClientManager
+var cm = NewClientManager()
 var tunDev tun.Device
 var ipPool *IpPool
-var pendingClients map[string]*Client
-var realToVirtual map[string]netip.Addr
+var pendingClients = common.NewConcurrentMap[string, *Client]()
+var realToVirtual = common.NewConcurrentMap[string, netip.Addr]()
 
 func main() {
 	logger = common.NewLogger(slog.LevelDebug)
 	ipPool = NewPool("12.0.0.1/24")
-	pendingClients = make(map[string]*Client)
-	realToVirtual = make(map[string]netip.Addr)
 	server = startUdpServer("0.0.0.0:8000")
 	defer server.Close()
 
@@ -109,7 +107,11 @@ func processClientPacket(buf []byte, clientAddr *net.UDPAddr) {
 	fmt.Println("buffer from client is ", buf[:20])
 	clientIp := clientAddr.IP.String() + ":" + strconv.Itoa(clientAddr.Port)
 
-	client := cm.GetClient(realToVirtual[clientIp])
+	clientVirtIp, ok := realToVirtual.Load(clientIp)
+	if !ok {
+		// TODO
+	}
+	client := cm.GetClient(clientVirtIp)
 	var packet common.Packet
 	if client != nil {
 		packet, _ = common.ParsePacket(buf, client.Key)
@@ -142,7 +144,7 @@ func processClientPacket(buf []byte, clientAddr *net.UDPAddr) {
 
 			fmt.Println("sendding IP", clientVirtualIp.AsSlice())
 			fmt.Println("sendidng mask", byte(ipPool.prefix.Bits()))
-			realToVirtual[clientIp] = clientVirtualIp
+			realToVirtual.Store(clientIp, clientVirtualIp)
 			server.WriteToUDP(
 				common.NewVirtualIpPacket(
 					clientVirtualIp.AsSlice(),
@@ -150,16 +152,26 @@ func processClientPacket(buf []byte, clientAddr *net.UDPAddr) {
 				).BytesEncrypted(client.Key),
 				clientAddr,
 			)
-			pendingClients[clientIp] = &client
+			pendingClients.Store(clientIp, &client)
 		}
 	case common.ClientReadyPacket:
 		{
-			clientVirtualIp := realToVirtual[clientIp]
-			cm.AddClient(clientVirtualIp, pendingClients[clientIp], func() {
+			clientVirtualIp, ok := realToVirtual.Load(clientIp)
+			if !ok {
+				// TODO
+			}
+
+			pendingClient, ok := pendingClients.Load(clientIp)
+			if !ok {
+				// TODO
+			}
+
+			cm.AddClient(clientVirtualIp, pendingClient, func() {
 				server.WriteToUDP(common.NewHeartbeatPacket().Bytes(), clientAddr)
 				logger.Debug("Heartbeat sent!", slog.String("clientIp", clientIp))
 			})
-			delete(pendingClients, clientIp)
+
+			pendingClients.Delete(clientIp)
 			logger.Debug("Client ready!", slog.String("clientIp", clientIp))
 		}
 	case common.TrafficPacket:
