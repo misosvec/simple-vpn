@@ -132,8 +132,6 @@ func SetupTunInterface(tunName string, mtu int) (tun.Device, error) {
 		return nil, err
 	}
 
-	fmt.Println("TUN device created:", tunName)
-
 	err = exec.Command("ip", "link", "set", tunName, "up").Run()
 	if err != nil {
 		return nil, err
