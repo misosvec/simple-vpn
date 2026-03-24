@@ -99,7 +99,7 @@ func PrintParsedPacket(raw []byte) {
 func GetDefaultRoute() ([]string, error) {
 	out, err := exec.Command("ip", "route", "show", "default").Output()
 	if err != nil {
-		return nil, fmt.Errorf("Failed to retrieve routing table: %w", err)
+		return nil, err
 	}
 
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
@@ -147,33 +147,32 @@ func DeleteInterface(iface string) error {
 	return nil
 }
 
-func EnableIpForwarding() {
+func EnableIpForwarding() error {
 	// TODO this changes last only until reboot
-	output, err := exec.Command("sudo", "sysctl", "-w", "net.ipv6.conf.all.forwarding=1").CombinedOutput()
+	_, err := exec.Command("sudo", "sysctl", "-w", "net.ipv6.conf.all.forwarding=1").CombinedOutput()
 	if err != nil {
-		fmt.Println(string(output))
-		panic(err)
+		return err
 	}
 
-	output, err = exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").CombinedOutput()
+	_, err = exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").CombinedOutput()
 	if err != nil {
-		fmt.Println(string(output))
-		panic(err)
+		return err
 	}
+	return nil
 }
 
-func SetIpAddress(addr string, iface string) {
-	output, err := exec.Command("ip", "addr", "add", addr, "dev", iface).CombinedOutput()
+func SetIpAddress(addr string, iface string) error {
+	_, err := exec.Command("ip", "addr", "add", addr, "dev", iface).CombinedOutput()
 	if err != nil {
-		fmt.Println(string(output))
-		panic(err)
+		return err
 	}
+	return nil
 }
 
-func EnablePostrouting(subnet string) {
-	output, err := exec.Command("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", subnet, "-o", "eth0", "-j", "MASQUERADE").CombinedOutput()
+func EnablePostrouting(subnet string) error {
+	_, err := exec.Command("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", subnet, "-o", "eth0", "-j", "MASQUERADE").CombinedOutput()
 	if err != nil {
-		fmt.Println(string(output))
-		panic(err)
+		return err
 	}
+	return nil
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/ecdh"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -15,6 +16,7 @@ import (
 
 	"vpn/common"
 
+	"golang.org/x/sync/errgroup"
 	"golang.zx2c4.com/wireguard/tun"
 )
 
@@ -27,23 +29,31 @@ const (
 )
 
 type Client struct {
-	serverIp      string
-	port          string
-	logger        *slog.Logger
-	conn          net.Conn
-	connMu        sync.Mutex // guards all conn.Write calls
-	tunDev        tun.Device
-	privKey       *ecdh.PrivateKey
-	sharedKey     []byte
-	hostIP        netip.Prefix
+	serverIp  string
+	port      string
+	logger    *slog.Logger
+	conn      net.Conn
+	connMu    sync.Mutex
+	tunDev    tun.Device
+	privKey   *ecdh.PrivateKey
+	sharedKey []byte
+	hostIP    netip.Prefix
+
 	previousRoute []string
+
 	// tunPacketCh carries raw IP packets read from the tun device.
 	// They are unencrypted and not yet ready to send over the wire.
 	tunPacketCh chan []byte
+
 	// serverPacketCh carries packets received and parsed from the server conn.
 	serverPacketCh chan common.Packet
-	ctx            context.Context
-	cancelFunc     context.CancelFunc
+
+	ctx        context.Context
+	cancelFunc context.CancelFunc
+
+	// stopOnce ensures Stop() is idempotent and safe to call concurrently.
+	stopOnce   sync.Once
+	lastActive time.Time
 }
 
 func NewClient(serverIp string, port string, logger *slog.Logger) *Client {
@@ -63,64 +73,103 @@ func (c *Client) Address() string {
 	return c.serverIp + ":" + c.port
 }
 
-// StartWorkers launches n goroutines that drain channel, calling do for each
-// value. Each goroutine calls wg.Done() when the channel is closed and drained.
-func StartWorkers[T any](wg *sync.WaitGroup, n int, channel chan T, do func(t T)) {
+// StartWorkers launches n goroutines inside g that drain channel, calling do
+// for each value. Only errors wrapped with fatal() are propagated to the
+// errgroup (triggering shutdown). Non-fatal errors must be handled — logged
+// and swallowed — by do itself. Each goroutine exits when the channel is
+// closed and drained, or when the errgroup context is cancelled.
+func StartWorkers[T any](g *errgroup.Group, ctx context.Context, n int, channel chan T, do func(T) error) {
 	for range n {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for val := range channel {
-				do(val)
+		g.Go(func() error {
+			for {
+				select {
+				case val, ok := <-channel:
+					if !ok {
+						return nil
+					}
+					if err := do(val); err != nil {
+						var fe common.FatalErr
+						if errors.As(err, &fe) {
+							return err // bubble up → cancels errgroup → shutdown
+						}
+						// Non-fatal: do() is responsible for logging. Keep going.
+					}
+				case <-ctx.Done():
+					return nil
+				}
 			}
-		}()
+		})
 	}
 }
 
-// writeToConn serializes concurrent conn.Write calls via a mutex.
-func (c *Client) writeToConn(data []byte) {
+// writeToConn serializes concurrent conn.Write calls via connMu.
+// It is a no-op if the connection has already been closed.
+func (c *Client) writeToConn(data []byte) error {
 	c.connMu.Lock()
 	defer c.connMu.Unlock()
 	if _, err := c.conn.Write(data); err != nil {
-		c.logger.Error("failed to write to server", slog.String("error", err.Error()))
+		if !errors.Is(err, net.ErrClosed) && c.ctx.Err() == nil {
+			c.logger.Error("failed to write to server", slog.Any("error", err))
+			return nil
+		}
+		return err
+	}
+	c.lastActive = time.Now()
+	return nil
+}
+
+// closeConn closes and nils c.conn under connMu, making writeToConn a safe
+// no-op after this point. Idempotent.
+func (c *Client) closeConn() {
+	c.connMu.Lock()
+	defer c.connMu.Unlock()
+	if c.conn != nil {
+		c.conn.Close()
+		c.conn = nil
 	}
 }
 
 // Connect connects to the server, sets up the tun interface, and performs key
 // exchange and virtual IP assignment synchronously. It returns once the client
 // is ready to process traffic. Call Run() afterwards to start the traffic loop.
+// On any failure after partial setup, Connect calls Stop() to clean up.
 func (c *Client) Connect() error {
 	conn, err := net.Dial("udp", c.Address())
 	if err != nil {
 		return fmt.Errorf("failed to connect to server: %w", err)
 	}
 	c.conn = conn
-	fmt.Println("Connected to server")
+	c.logger.Info("connected to server", slog.String("addr", c.Address()))
 
 	tunDev, err := common.SetupTunInterface(tunIface, mtu)
 	if err != nil {
+		c.Stop()
 		return fmt.Errorf("failed to setup tun interface: %w", err)
 	}
 	c.tunDev = tunDev
 
-	// small delay to propagate the tun interface to the kernel
+	// Small delay to let the kernel propagate the new tun interface.
 	time.Sleep(100 * time.Millisecond)
 
 	previousRoute, err := common.GetDefaultRoute()
 	if err != nil {
+		c.Stop()
 		return fmt.Errorf("failed to get default route: %w", err)
 	}
 	c.previousRoute = previousRoute
 
 	if err := common.SetDefaultRoute([]string{"default", "dev", tunIface}); err != nil {
+		c.Stop()
 		return fmt.Errorf("failed to set default route: %w", err)
 	}
 
 	if err := c.exchangeKeys(); err != nil {
+		c.Stop()
 		return fmt.Errorf("key exchange failed: %w", err)
 	}
 
 	if err := c.receiveVirtualIP(); err != nil {
+		c.Stop()
 		return fmt.Errorf("virtual IP assignment failed: %w", err)
 	}
 
@@ -128,45 +177,87 @@ func (c *Client) Connect() error {
 }
 
 // Run starts the worker goroutines and blocks until all of them have finished.
-// Shutdown is triggered by Stop(), which closes the conn and tun device, causing
-// the two reader goroutines (readTun, readFromServer) to return and close their
-// respective channels. The workers drain those channels and exit, at which point
-// Run() returns.
+// It returns the first fatal error from any goroutine, or nil on clean shutdown.
+//
+// Shutdown sequence:
+//  1. A fatal error OR Stop() cancels the errgroup context (gCtx).
+//  2. The context watcher calls Stop(), closing conn and tun device.
+//  3. readTun and readFromServer unblock, detect cancellation, and return —
+//     closing tunPacketCh and serverPacketCh respectively.
+//  4. Worker goroutines drain their channels and exit.
+//  5. g.Wait() unblocks and Run() returns.
 func (c *Client) Run() error {
-	var wg sync.WaitGroup
-	StartWorkers(&wg, outboundWorkers, c.tunPacketCh, c.encryptAndSend)
-	StartWorkers(&wg, inboundWorkers, c.serverPacketCh, c.handlePacket)
+	g, gCtx := errgroup.WithContext(c.ctx)
 
-	var readerWg sync.WaitGroup
-	readerWg.Add(2)
+	StartWorkers(g, gCtx, outboundWorkers, c.tunPacketCh, c.encryptAndSend)
+	StartWorkers(g, gCtx, inboundWorkers, c.serverPacketCh, c.handlePacket)
+
+	g.Go(func() error { return c.readTun() })
+	g.Go(func() error { return c.readFromServer() })
+	g.Go(func() error { return c.sendHeartbeat() })
+
+	// When any goroutine fails (or Stop() is called externally), gCtx is
+	// cancelled. We then call Stop() to close conn/tun and unblock any goroutines
+	// still waiting on I/O. This watcher is intentionally outside g to avoid
+	// a self-referential cancel cycle.
 	go func() {
-		defer readerWg.Done()
-		c.readTun()
-	}()
-	go func() {
-		defer readerWg.Done()
-		c.readFromServer()
+		<-gCtx.Done()
+		c.Stop()
 	}()
 
-	readerWg.Wait()
-	wg.Wait()
-	return nil
+	err := g.Wait()
+	// Context cancellation is the normal shutdown path — not an error for the caller.
+	if errors.Is(err, context.Canceled) {
+		return nil
+	}
+	return err
 }
 
+func (c *Client) sendHeartbeat() error {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if time.Since(c.lastActive) >= 30*time.Second {
+				if err := c.writeToConn(common.NewHeartbeatPacket().Bytes()); err != nil {
+					return common.NewFatalError(fmt.Errorf("heartbeat write failed: %w", err))
+				}
+				c.logger.Debug("client sent heartbeat")
+			}
+		case <-c.ctx.Done():
+			return nil
+		}
+	}
+}
+
+// Stop shuts the client down cleanly. Safe to call multiple times and from
+// multiple goroutines concurrently.
 func (c *Client) Stop() {
-	c.cancelFunc()
-	if c.tunDev != nil {
-		c.tunDev.Close()
-		c.tunDev = nil
-	}
-	if c.conn != nil {
-		c.conn.Close()
-		c.conn = nil
-	}
-	if c.previousRoute != nil {
-		common.SetDefaultRoute(c.previousRoute)
-		c.previousRoute = nil
-	}
+	c.stopOnce.Do(func() {
+		// 1. Cancel the context first so goroutines can distinguish expected
+		//    close errors from unexpected ones.
+		c.cancelFunc()
+
+		// 2. Close tun device — unblocks readTun.
+		if c.tunDev != nil {
+			c.tunDev.Close()
+			c.tunDev = nil
+		}
+
+		// 3. Close the connection under connMu — unblocks readFromServer and
+		//    makes subsequent writeToConn calls a safe no-op.
+		c.closeConn()
+
+		// 4. Restore the original default route.
+		if c.previousRoute != nil {
+			if err := common.SetDefaultRoute(c.previousRoute); err != nil {
+				c.logger.Error("failed to restore default route", slog.Any("error", err))
+			}
+			c.previousRoute = nil
+		}
+	})
 }
 
 func (c *Client) exchangeKeys() error {
@@ -203,7 +294,7 @@ func (c *Client) exchangeKeys() error {
 		return fmt.Errorf("ECDH failed: %w", err)
 	}
 
-	c.logger.Debug("Shared key generated!")
+	c.logger.Debug("shared key generated")
 	return nil
 }
 
@@ -228,18 +319,23 @@ func (c *Client) receiveVirtualIP() error {
 		return fmt.Errorf("invalid virtual address: %w", err)
 	}
 
-	common.SetIpAddress(virtAddr.String(), tunIface)
+	err = common.SetIpAddress(virtAddr.String(), tunIface)
+	if err != nil {
+		return fmt.Errorf("failed to set virtual IP address: %w", err)
+	}
 	c.hostIP = virtAddr
 
 	if _, err := c.conn.Write(common.NewClientReadyPacket().Bytes()); err != nil {
 		return fmt.Errorf("failed to send client ready: %w", err)
 	}
 
-	c.logger.Debug("VirtualIP set! Client ready!")
+	c.logger.Debug("virtual IP set, client ready")
 	return nil
 }
 
-func (c *Client) readTun() {
+// readTun reads raw IP packets from the tun device and pushes them onto
+// tunPacketCh. Any unexpected read error is returned as fatal.
+func (c *Client) readTun() error {
 	defer close(c.tunPacketCh)
 	bufs := make([][]byte, 16)
 	for i := range bufs {
@@ -250,10 +346,10 @@ func (c *Client) readTun() {
 		packetsRead, err := c.tunDev.Read(bufs, sizes, tunOffset)
 		if err != nil {
 			if c.ctx.Err() != nil {
-				return
+				// expected shutdown
+				return nil
 			}
-			c.logger.Error("tun read error", slog.String("error", err.Error()))
-			return
+			return common.NewFatalError(fmt.Errorf("tun read failed: %w", err))
 		}
 		for i := range packetsRead {
 			data := make([]byte, sizes[i])
@@ -264,81 +360,91 @@ func (c *Client) readTun() {
 }
 
 // encryptAndSend encrypts a raw tun packet and writes it to the server conn.
-func (c *Client) encryptAndSend(data []byte) {
+// A failed write is non-fatal: the packet is dropped and logged, but the
+// worker keeps running.
+func (c *Client) encryptAndSend(data []byte) error {
 	packet := common.NewTrafficPacket(data)
 	if !common.FilterPacket(packet, c.hostIP) {
-		return
+		return nil
 	}
 	common.PrintParsedPacket(packet.Data())
 	c.writeToConn(packet.BytesEncrypted(c.sharedKey))
+	// writeToConn handles its own logging; outbound packet loss is non-fatal.
+	return nil
 }
 
-func (c *Client) readFromServer() {
+// readFromServer reads and parses packets from the server connection and pushes
+// them onto serverPacketCh. A lost connection is fatal; a bad packet is not.
+func (c *Client) readFromServer() error {
 	defer close(c.serverPacketCh)
 	buf := make([]byte, mtu)
-	fmt.Println("CLIENT: reading from server")
+	c.logger.Debug("reading from server")
 	for {
 		bytesRead, err := c.conn.Read(buf)
 		if err != nil {
 			if c.ctx.Err() != nil {
-				return
+				return nil // expected shutdown
 			}
-			c.logger.Error("server read error", slog.String("error", err.Error()))
-			return
+			return common.NewFatalError(fmt.Errorf("server read failure: %w", err))
 		}
 		packet, err := common.ParsePacket(buf[:bytesRead], c.sharedKey)
 		if err != nil {
-			c.logger.Error("failed to parse packet", slog.String("error", err.Error()))
+			// A single malformed packet is non-fatal — log and keep reading.
+			c.logger.Error("failed to parse packet, skipping", slog.Any("error", err))
 			continue
 		}
 		c.serverPacketCh <- packet
 	}
 }
 
-func (c *Client) handlePacket(packet common.Packet) {
-	var err error
+// handlePacket dispatches a packet to the appropriate handler.
+func (c *Client) handlePacket(packet common.Packet) error {
 	switch p := packet.(type) {
 	case common.TrafficPacket:
-		err = c.handleTraffic(p)
-	case common.HeartbeatPacket:
-		err = c.handleHeartbeat()
+		return c.handleTraffic(p)
 	}
-	if err != nil {
-		c.logger.Error("Failed to handle a packet", slog.String("error", err.Error()))
-	}
+	return nil
 }
 
+// handleTraffic writes a received traffic packet into the tun device.
+// A tun write failure is fatal — the device is broken and the client
+// cannot forward traffic anymore.
 func (c *Client) handleTraffic(p common.TrafficPacket) error {
-	common.PrintParsedPacket(p.Bytes())
 	tunBuf := make([]byte, tunOffset+p.DataLen())
 	copy(tunBuf[tunOffset:], p.Data())
-	_, err := c.tunDev.Write([][]byte{tunBuf}, tunOffset)
-	return err
-}
-
-func (c *Client) handleHeartbeat() error {
-	c.writeToConn(common.NewHeartbeatPacket().Bytes())
-	c.logger.Debug("Client sent heartbeat answer!")
+	if _, err := c.tunDev.Write([][]byte{tunBuf}, tunOffset); err != nil {
+		// expected shutdown
+		if c.ctx.Err() != nil {
+			return nil
+		}
+		return common.NewFatalError(fmt.Errorf("tun write failure: %w", err))
+	}
 	return nil
 }
 
 func main() {
-	client := NewClient("vpn-server-cont", "8000", common.NewLogger(slog.LevelDebug))
+	logger := common.NewLogger(slog.LevelDebug)
+	client := NewClient("vpn-server-cont", "8000", logger)
+
 	if err := client.Connect(); err != nil {
-		panic(err)
+		logger.Error("connect failed", slog.Any("error", err))
+		os.Exit(1)
 	}
+
 	defer client.Stop()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
-		<-sigCh
-		fmt.Println("Received shutdown signal")
+		sig := <-sigCh
+		logger.Info("received signal, shutting down", slog.String("signal", sig.String()))
 		client.Stop()
-		os.Exit(0) // Optional: ensure prompt exit after Stop()
+		// Do NOT call os.Exit here — let Run() return naturally so that
+		// deferred cleanup in main() and any future callers also runs.
 	}()
 
 	if err := client.Run(); err != nil {
-		panic(err)
+		logger.Error("run failed", slog.Any("error", err))
+		os.Exit(1)
 	}
 }

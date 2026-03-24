@@ -29,3 +29,13 @@ func (cm *ConcurrentMap[K, V]) Delete(key K) {
 	defer cm.k.Unlock()
 	delete(cm.m, key)
 }
+
+func (cm *ConcurrentMap[K, V]) Range(f func(K, V) bool) {
+	cm.k.RLock()
+	defer cm.k.RUnlock()
+	for k, v := range cm.m {
+		if !f(k, v) {
+			return
+		}
+	}
+}
