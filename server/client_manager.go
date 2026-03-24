@@ -47,3 +47,14 @@ func (cm *ClientManager) UpdateLastSeen(virtualIp netip.Addr) {
 		c.LastSeen = time.Now()
 	}
 }
+
+func (cm *ClientManager) AllClients() []*Client {
+	clients := []*Client{}
+
+	cm.clients.Range(func(_ netip.Addr, c *Client) bool {
+		clients = append(clients, c)
+		return true
+	})
+
+	return clients
+}

@@ -9,63 +9,77 @@ import (
 	"net"
 	"net/netip"
 	"os"
-	"os/signal"
+	"runtime"
 	"sync"
-	"syscall"
 	"time"
-
 	"vpn/common"
 
 	"golang.org/x/sync/errgroup"
 	"golang.zx2c4.com/wireguard/tun"
 )
 
+func main() {
+	logger := common.NewLogger(slog.LevelDebug)
+	client := NewClient("vpn-server-cont", "8000", logger)
+
+	if err := client.Connect(); err != nil {
+		logger.Error("connect failed", slog.Any("error", err))
+		os.Exit(1)
+	}
+
+	defer client.Stop()
+
+	if err := client.Run(); err != nil {
+		logger.Error("run failed", slog.Any("error", err))
+		os.Exit(1)
+	}
+}
+
 const (
-	tunOffset       = 10
-	mtu             = 1500
-	tunIface        = "tun7"
-	outboundWorkers = 4
-	inboundWorkers  = 4
+	tunOffset = 10
+	mtu       = 1500
+	tunIface  = "tun7"
 )
 
 type Client struct {
-	serverIp  string
-	port      string
-	logger    *slog.Logger
-	conn      net.Conn
-	connMu    sync.Mutex
-	tunDev    tun.Device
-	privKey   *ecdh.PrivateKey
-	sharedKey []byte
-	hostIP    netip.Prefix
-
-	previousRoute []string
-
-	// tunPacketCh carries raw IP packets read from the tun device.
-	// They are unencrypted and not yet ready to send over the wire.
-	tunPacketCh chan []byte
-
-	// serverPacketCh carries packets received and parsed from the server conn.
-	serverPacketCh chan common.Packet
-
-	ctx        context.Context
-	cancelFunc context.CancelFunc
+	serverIp         string
+	port             string
+	logger           *slog.Logger
+	conn             net.Conn
+	connMu           sync.Mutex
+	tunDev           tun.Device
+	privKey          *ecdh.PrivateKey
+	sharedKey        []byte
+	hostIP           netip.Prefix
+	previousRoute    []string
+	outboundPacketCh chan []byte
+	inboundPacketsCh chan common.Packet
+	ctx              context.Context
+	cancelFunc       context.CancelFunc
 
 	// stopOnce ensures Stop() is idempotent and safe to call concurrently.
 	stopOnce   sync.Once
 	lastActive time.Time
+
+	tunBufPool sync.Pool
 }
 
 func NewClient(serverIp string, port string, logger *slog.Logger) *Client {
 	ctx, cancelFunc := context.WithCancel(context.Background())
 	return &Client{
-		serverIp:       serverIp,
-		port:           port,
-		logger:         logger,
-		tunPacketCh:    make(chan []byte, 1024),
-		serverPacketCh: make(chan common.Packet, 1024),
-		ctx:            ctx,
-		cancelFunc:     cancelFunc,
+		serverIp:         serverIp,
+		port:             port,
+		logger:           logger,
+		outboundPacketCh: make(chan []byte, 1024),
+		inboundPacketsCh: make(chan common.Packet, 1024),
+		ctx:              ctx,
+		cancelFunc:       cancelFunc,
+		tunBufPool: sync.Pool{
+			New: func() any {
+				buf := make([]byte, tunOffset+mtu)
+				return &buf
+			},
+		},
 	}
 }
 
@@ -129,15 +143,12 @@ func (c *Client) closeConn() {
 	}
 }
 
-// Connect connects to the server, sets up the tun interface, and performs key
-// exchange and virtual IP assignment synchronously. It returns once the client
-// is ready to process traffic. Call Run() afterwards to start the traffic loop.
-// On any failure after partial setup, Connect calls Stop() to clean up.
 func (c *Client) Connect() error {
 	conn, err := net.Dial("udp", c.Address())
 	if err != nil {
 		return fmt.Errorf("failed to connect to server: %w", err)
 	}
+
 	c.conn = conn
 	c.logger.Info("connected to server", slog.String("addr", c.Address()))
 
@@ -148,7 +159,7 @@ func (c *Client) Connect() error {
 	}
 	c.tunDev = tunDev
 
-	// Small delay to let the kernel propagate the new tun interface.
+	// small delay to let the kernel propagate the new tun interface.
 	time.Sleep(100 * time.Millisecond)
 
 	previousRoute, err := common.GetDefaultRoute()
@@ -189,8 +200,17 @@ func (c *Client) Connect() error {
 func (c *Client) Run() error {
 	g, gCtx := errgroup.WithContext(c.ctx)
 
-	StartWorkers(g, gCtx, outboundWorkers, c.tunPacketCh, c.encryptAndSend)
-	StartWorkers(g, gCtx, inboundWorkers, c.serverPacketCh, c.handlePacket)
+	numCPU := runtime.GOMAXPROCS(0)
+
+	// We split the workers: half for encryption/sending, half for receiving/decryption.
+	// We ensure at least 1 worker even on single-core machines.
+	workers := numCPU / 2
+	if workers < 1 {
+		workers = 1
+	}
+
+	StartWorkers(g, gCtx, workers, c.outboundPacketCh, c.encryptAndSend)
+	StartWorkers(g, gCtx, workers, c.inboundPacketsCh, c.processInboundPacket)
 
 	g.Go(func() error { return c.readTun() })
 	g.Go(func() error { return c.readFromServer() })
@@ -336,115 +356,82 @@ func (c *Client) receiveVirtualIP() error {
 // readTun reads raw IP packets from the tun device and pushes them onto
 // tunPacketCh. Any unexpected read error is returned as fatal.
 func (c *Client) readTun() error {
-	defer close(c.tunPacketCh)
+	defer close(c.outboundPacketCh)
 	bufs := make([][]byte, 16)
 	for i := range bufs {
-		bufs[i] = make([]byte, mtu)
+		bufs[i] = make([]byte, tunOffset+mtu)
 	}
 	sizes := make([]int, 16)
 	for {
 		packetsRead, err := c.tunDev.Read(bufs, sizes, tunOffset)
 		if err != nil {
 			if c.ctx.Err() != nil {
-				// expected shutdown
 				return nil
 			}
 			return common.NewFatalError(fmt.Errorf("tun read failed: %w", err))
 		}
 		for i := range packetsRead {
-			data := make([]byte, sizes[i])
+			bufPtr := c.tunBufPool.Get().(*[]byte)
+			data := (*bufPtr)[:sizes[i]]
 			copy(data, bufs[i][tunOffset:tunOffset+sizes[i]])
-			c.tunPacketCh <- data
+			c.outboundPacketCh <- data
 		}
 	}
 }
 
-// encryptAndSend encrypts a raw tun packet and writes it to the server conn.
-// A failed write is non-fatal: the packet is dropped and logged, but the
-// worker keeps running.
 func (c *Client) encryptAndSend(data []byte) error {
+	defer func() {
+		// return buffer back to buffer pool
+		full := data[:cap(data)]
+		c.tunBufPool.Put(&full)
+	}()
+
 	packet := common.NewTrafficPacket(data)
 	if !common.FilterPacket(packet, c.hostIP) {
 		return nil
 	}
 	common.PrintParsedPacket(packet.Data())
 	c.writeToConn(packet.BytesEncrypted(c.sharedKey))
-	// writeToConn handles its own logging; outbound packet loss is non-fatal.
 	return nil
 }
 
-// readFromServer reads and parses packets from the server connection and pushes
-// them onto serverPacketCh. A lost connection is fatal; a bad packet is not.
 func (c *Client) readFromServer() error {
-	defer close(c.serverPacketCh)
+	defer close(c.inboundPacketsCh)
 	buf := make([]byte, mtu)
-	c.logger.Debug("reading from server")
 	for {
 		bytesRead, err := c.conn.Read(buf)
+
 		if err != nil {
 			if c.ctx.Err() != nil {
-				return nil // expected shutdown
+				return nil
 			}
 			return common.NewFatalError(fmt.Errorf("server read failure: %w", err))
 		}
+
 		packet, err := common.ParsePacket(buf[:bytesRead], c.sharedKey)
 		if err != nil {
-			// A single malformed packet is non-fatal — log and keep reading.
 			c.logger.Error("failed to parse packet, skipping", slog.Any("error", err))
 			continue
 		}
-		c.serverPacketCh <- packet
+		c.inboundPacketsCh <- packet
 	}
 }
 
-// handlePacket dispatches a packet to the appropriate handler.
-func (c *Client) handlePacket(packet common.Packet) error {
+func (c *Client) processInboundPacket(packet common.Packet) error {
 	switch p := packet.(type) {
 	case common.TrafficPacket:
-		return c.handleTraffic(p)
-	}
-	return nil
-}
-
-// handleTraffic writes a received traffic packet into the tun device.
-// A tun write failure is fatal — the device is broken and the client
-// cannot forward traffic anymore.
-func (c *Client) handleTraffic(p common.TrafficPacket) error {
-	tunBuf := make([]byte, tunOffset+p.DataLen())
-	copy(tunBuf[tunOffset:], p.Data())
-	if _, err := c.tunDev.Write([][]byte{tunBuf}, tunOffset); err != nil {
-		// expected shutdown
-		if c.ctx.Err() != nil {
-			return nil
+		bufPtr := c.tunBufPool.Get().(*[]byte)
+		size := tunOffset + p.DataLen()
+		buf := (*bufPtr)[:size]
+		copy(buf[tunOffset:], p.Data())
+		_, err := c.tunDev.Write([][]byte{buf}, tunOffset)
+		c.tunBufPool.Put(bufPtr)
+		if err != nil {
+			if c.ctx.Err() != nil {
+				return nil
+			}
+			return common.NewFatalError(fmt.Errorf("tun write failure: %w", err))
 		}
-		return common.NewFatalError(fmt.Errorf("tun write failure: %w", err))
 	}
 	return nil
-}
-
-func main() {
-	logger := common.NewLogger(slog.LevelDebug)
-	client := NewClient("vpn-server-cont", "8000", logger)
-
-	if err := client.Connect(); err != nil {
-		logger.Error("connect failed", slog.Any("error", err))
-		os.Exit(1)
-	}
-
-	defer client.Stop()
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		sig := <-sigCh
-		logger.Info("received signal, shutting down", slog.String("signal", sig.String()))
-		client.Stop()
-		// Do NOT call os.Exit here — let Run() return naturally so that
-		// deferred cleanup in main() and any future callers also runs.
-	}()
-
-	if err := client.Run(); err != nil {
-		logger.Error("run failed", slog.Any("error", err))
-		os.Exit(1)
-	}
 }

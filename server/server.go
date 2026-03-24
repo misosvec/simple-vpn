@@ -244,9 +244,10 @@ func (s *Server) processClientPacket(incP common.IncomingPacket) error {
 		s.handleClientReady(clientKey, incP.Addr)
 	case common.TrafficPacket:
 		s.handleTraffic(clientKey, p)
-	case common.HeartbeatPacket:{
-		s.logger.Debug("heartbeat received", slog.String("clientKey", clientKey))
-	}
+	case common.HeartbeatPacket:
+		{
+			s.logger.Debug("heartbeat received", slog.String("clientKey", clientKey))
+		}
 	default:
 		s.logger.Debug("unknown packet type", slog.String("clientKey", clientKey))
 	}
@@ -344,6 +345,26 @@ func (s *Server) sendPacketToClient(p common.Packet) error {
 	return nil
 }
 
+func (s *Server) evictionLoop() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+			now := time.Now()
+			for _, client := range s.cm.AllClients() {
+				if now.Sub(client.LastSeen) > 60*time.Second {
+					s.logger.Info("evicting inactive client", slog.String("client", client.Addr.String()))
+					s.cm.RemoveClient(client.VirtualIP)
+					s.ipPool.Release(client.VirtualIP)
+				}
+			}
+		}
+	}
+}
+
 // startWorkers launches n goroutines inside g that drain ch, calling do for
 // each value. Fatal errors propagate; non-fatal ones must be handled by do.
 func startWorkers[T any](g *errgroup.Group, ctx context.Context, n int, ch chan T, do func(T) error) {
@@ -378,6 +399,8 @@ func main() {
 		os.Exit(1)
 	}
 	defer server.Stop()
+
+	go server.evictionLoop()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
